@@ -1,0 +1,15 @@
+# 核心依赖
+# torch 请按你的 CUDA 版本单独安装，例如：
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch>=2.4
+
+# Triton 通常随 torch 安装；若缺失（Windows 原生环境常见）再单独装：
+#   pip install triton
+
+# 画图与数值计算
+numpy>=1.26
+matplotlib>=3.8
+
+# CUDA 扩展编译必需：torch.utils.cpp_extension.load_inline 依赖 ninja 作为构建后端。
+# 漏了它会在第一次编译 kernel 时报 "Ninja is required to load C++ extensions"。
+ninja

@@ -1,0 +1,60 @@
+==PROF== Connected to process 438 (<PYTHON>)
+==PROF== Profiling "vectorized_layer_norm_kernel" - 0 (1/6): 0%....50%....100% - 8 passes
+==PROF== Profiling "vectorized_layer_norm_kernel" - 1 (2/6): 0%....50%....100% - 8 passes
+==PROF== Profiling "vectorized_layer_norm_kernel" - 2 (3/6): 0%....50%....100% - 8 passes
+==PROF== Profiling "vectorized_layer_norm_kernel" - 3 (4/6): 0%....50%....100% - 8 passes
+layer_norm: 完成，shape=(1,2048,4096) fp16
+==PROF== Disconnected from process 438
+[438] python3.11@127.0.0.1
+  void unnamed>::vectorized_layer_norm_kernel<Half, float, 0>(int, T2, const T1 *, const T1 *, const T1 *, T2 *, T2 *, T1 *) (2048, 1, 1)x(32, 4, 1), Device 0, CC 8.9, Invocations 4
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- --------- --------- ---------
+    Metric Name             Metric Unit   Minimum   Maximum   Average
+    ----------------------- ----------- --------- --------- ---------
+    DRAM Frequency                  Ghz      8.19      8.19      8.19
+    SM Frequency                    Ghz      1.54      1.54      1.54
+    Elapsed Cycles                cycle 182165.00 186739.00 184368.75
+    Memory Throughput                 %     90.12     91.08     90.72
+    DRAM Throughput                   %     90.12     91.08     90.72
+    Duration                         us    118.14    121.09    119.55
+    L1/TEX Cache Throughput           %     32.06     40.23     36.56
+    L2 Cache Throughput               %     28.58     29.32     28.96
+    SM Active Cycles              cycle 137450.58 176766.50 153688.76
+    Compute (SM) Throughput           %     54.58     62.30     57.17
+    ----------------------- ----------- --------- --------- ---------
+
+    Section: Memory Workload Analysis
+    ---------------------------- ----------- ------- ------- -------
+    Metric Name                  Metric Unit Minimum Maximum Average
+    ---------------------------- ----------- ------- ------- -------
+    Memory Throughput                Gbyte/s  236.07  238.66  237.72
+    Mem Busy                               %   29.78   34.17   31.28
+    Max Bandwidth                          %   90.12   91.08   90.72
+    L1/TEX Hit Rate                        %   57.76   57.84   57.78
+    L2 Compression Success Rate            %    0.00    0.00    0.00
+    L2 Compression Ratio                        0.00    0.00    0.00
+    L2 Compression Input Sectors      sector    0.00    0.00    0.00
+    L2 Hit Rate                            %   66.27   66.51   66.36
+    Mem Pipes Busy                         %   31.38   35.82   32.87
+    ---------------------------- ----------- ------- ------- -------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------- ------- -------
+    Metric Name                     Metric Unit Minimum Maximum Average
+    ------------------------------- ----------- ------- ------- -------
+    Block Limit SM                        block   24.00   24.00   24.00
+    Block Limit Registers                 block   16.00   16.00   16.00
+    Block Limit Shared Mem                block   28.00   28.00   28.00
+    Block Limit Warps                     block   12.00   12.00   12.00
+    Theoretical Active Warps per SM        warp   48.00   48.00   48.00
+    Theoretical Occupancy                     %  100.00  100.00  100.00
+    Achieved Occupancy                        %   92.75   93.48   93.14
+    Achieved Active Warps Per SM           warp   44.52   44.87   44.71
+    ------------------------------- ----------- ------- ------- -------
+
+  Note: The shown averages are calculated as the arithmetic mean of the metric values after the evaluation of the    
+  metrics for each individual kernel launch.                                                                         
+  If aggregating across varying launch configurations (like shared memory, cache config settings), the arithmetic    
+  mean can be misleading and looking at the individual results is recommended instead.                               
+  This output mode is backwards compatible to the per-kernel summary output of nvprof                                
+

@@ -1,0 +1,292 @@
+==PROF== Connected to process 539 (<PYTHON>)
+==PROF== Profiling "elementwise_kernel" - 0 (1/6): 0%....50%....100% - 8 passes
+==PROF== Profiling "vectorized_elementwise_kernel" - 1 (2/6): 0%....50%....100% - 8 passes
+==PROF== Profiling "elementwise_kernel" - 2 (3/6): 0%....50%....100% - 8 passes
+==PROF== Profiling "unrolled_elementwise_kernel" - 3 (4/6): 0%....50%....100% - 8 passes
+==PROF== Profiling "vectorized_elementwise_kernel" - 4 (5/6): 0%....50%....100% - 8 passes
+==PROF== Profiling "reduce_kernel" - 5 (6/6): 0%....50%....100% - 8 passes
+rmsnorm_naive: 完成，shape=(1,2048,4096) fp16
+==PROF== Disconnected from process 539
+[539] python3.11@127.0.0.1
+  void elementwise_kernel<128, 2, void gpu_kernel_impl_nocast<BinaryFunctor<float, float, float, binary_internal::MulFunctor<float>>>(TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3) (32768, 1, 1)x(128, 1, 1), Device 0, CC 8.9, Invocations 1
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- --------- --------- ---------
+    Metric Name             Metric Unit   Minimum   Maximum   Average
+    ----------------------- ----------- --------- --------- ---------
+    DRAM Frequency                  Ghz      8.19      8.19      8.19
+    SM Frequency                    Ghz      1.54      1.54      1.54
+    Elapsed Cycles                cycle 397828.00 397828.00 397828.00
+    Memory Throughput                 %     93.84     93.84     93.84
+    DRAM Throughput                   %     93.84     93.84     93.84
+    Duration                         us    257.57    257.57    257.57
+    L1/TEX Cache Throughput           %     29.12     29.12     29.12
+    L2 Cache Throughput               %     25.89     25.89     25.89
+    SM Active Cycles              cycle 371599.79 371599.79 371599.79
+    Compute (SM) Throughput           %     32.85     32.85     32.85
+    ----------------------- ----------- --------- --------- ---------
+
+    Section: Memory Workload Analysis
+    ---------------------------- ----------- ------- ------- -------
+    Metric Name                  Metric Unit Minimum Maximum Average
+    ---------------------------- ----------- ------- ------- -------
+    Memory Throughput                Gbyte/s  246.00  246.00  246.00
+    Mem Busy                               %   25.89   25.89   25.89
+    Max Bandwidth                          %   93.84   93.84   93.84
+    L1/TEX Hit Rate                        %   10.85   10.85   10.85
+    L2 Compression Success Rate            %    0.00    0.00    0.00
+    L2 Compression Ratio                        0.00    0.00    0.00
+    L2 Compression Input Sectors      sector    0.00    0.00    0.00
+    L2 Hit Rate                            %   50.18   50.18   50.18
+    Mem Pipes Busy                         %   21.39   21.39   21.39
+    ---------------------------- ----------- ------- ------- -------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------- ------- -------
+    Metric Name                     Metric Unit Minimum Maximum Average
+    ------------------------------- ----------- ------- ------- -------
+    Block Limit SM                        block   24.00   24.00   24.00
+    Block Limit Registers                 block   32.00   32.00   32.00
+    Block Limit Shared Mem                block   32.00   32.00   32.00
+    Block Limit Warps                     block   12.00   12.00   12.00
+    Theoretical Active Warps per SM        warp   48.00   48.00   48.00
+    Theoretical Occupancy                     %  100.00  100.00  100.00
+    Achieved Occupancy                        %   89.65   89.65   89.65
+    Achieved Active Warps Per SM           warp   43.03   43.03   43.03
+    ------------------------------- ----------- ------- ------- -------
+
+  void elementwise_kernel<128, 4, void gpu_kernel_impl_nocast<BinaryFunctor<c10::Half, c10::Half, c10::Half, binary_internal::MulFunctor<float>>>(TensorIteratorBase &, const T1 &)::[lambda(int) (instance 1)]>(int, T3) (16384, 1, 1)x(128, 1, 1), Device 0, CC 8.9, Invocations 1
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- --------- --------- ---------
+    Metric Name             Metric Unit   Minimum   Maximum   Average
+    ----------------------- ----------- --------- --------- ---------
+    DRAM Frequency                  Ghz      8.19      8.19      8.19
+    SM Frequency                    Ghz      1.54      1.54      1.54
+    Elapsed Cycles                cycle 225971.00 225971.00 225971.00
+    Memory Throughput                 %     69.40     69.40     69.40
+    DRAM Throughput                   %     69.40     69.40     69.40
+    Duration                         us    146.34    146.34    146.34
+    L1/TEX Cache Throughput           %     32.49     32.49     32.49
+    L2 Cache Throughput               %     23.14     23.14     23.14
+    SM Active Cycles              cycle 218505.79 218505.79 218505.79
+    Compute (SM) Throughput           %     53.72     53.72     53.72
+    ----------------------- ----------- --------- --------- ---------
+
+    Section: Memory Workload Analysis
+    ---------------------------- ----------- ------- ------- -------
+    Metric Name                  Metric Unit Minimum Maximum Average
+    ---------------------------- ----------- ------- ------- -------
+    Memory Throughput                Gbyte/s  181.81  181.81  181.81
+    Mem Busy                               %   16.51   16.51   16.51
+    Max Bandwidth                          %   69.40   69.40   69.40
+    L1/TEX Hit Rate                        %   45.31   45.31   45.31
+    L2 Compression Success Rate            %    0.00    0.00    0.00
+    L2 Compression Ratio                        0.00    0.00    0.00
+    L2 Compression Input Sectors      sector    0.00    0.00    0.00
+    L2 Hit Rate                            %   51.27   51.27   51.27
+    Mem Pipes Busy                         %   31.39   31.39   31.39
+    ---------------------------- ----------- ------- ------- -------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------- ------- -------
+    Metric Name                     Metric Unit Minimum Maximum Average
+    ------------------------------- ----------- ------- ------- -------
+    Block Limit SM                        block   24.00   24.00   24.00
+    Block Limit Registers                 block   32.00   32.00   32.00
+    Block Limit Shared Mem                block   32.00   32.00   32.00
+    Block Limit Warps                     block   12.00   12.00   12.00
+    Theoretical Active Warps per SM        warp   48.00   48.00   48.00
+    Theoretical Occupancy                     %  100.00  100.00  100.00
+    Achieved Occupancy                        %   91.67   91.67   91.67
+    Achieved Active Warps Per SM           warp   44.00   44.00   44.00
+    ------------------------------- ----------- ------- ------- -------
+
+  void reduce_kernel<512, 1, ReduceOp<float, MeanOps<float, float, float, float>, unsigned int, float, 4, 4>>(T3) (128, 1, 1)x(32, 16, 1), Device 0, CC 8.9, Invocations 1
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- --------- --------- ---------
+    Metric Name             Metric Unit   Minimum   Maximum   Average
+    ----------------------- ----------- --------- --------- ---------
+    DRAM Frequency                  Ghz      8.19      8.19      8.19
+    SM Frequency                    Ghz      1.54      1.54      1.54
+    Elapsed Cycles                cycle 259416.00 259416.00 259416.00
+    Memory Throughput                 %     92.73     92.73     92.73
+    DRAM Throughput                   %     92.73     92.73     92.73
+    Duration                         us    167.97    167.97    167.97
+    L1/TEX Cache Throughput           %     19.28     19.28     19.28
+    L2 Cache Throughput               %     31.07     31.07     31.07
+    SM Active Cycles              cycle 226667.29 226667.29 226667.29
+    Compute (SM) Throughput           %      4.33      4.33      4.33
+    ----------------------- ----------- --------- --------- ---------
+
+    Section: Memory Workload Analysis
+    ---------------------------- ----------- ------- ------- -------
+    Metric Name                  Metric Unit Minimum Maximum Average
+    ---------------------------- ----------- ------- ------- -------
+    Memory Throughput                Gbyte/s  243.03  243.03  243.03
+    Mem Busy                               %   15.39   15.39   15.39
+    Max Bandwidth                          %   92.73   92.73   92.73
+    L1/TEX Hit Rate                        %    0.18    0.18    0.18
+    L2 Compression Success Rate            %    0.00    0.00    0.00
+    L2 Compression Ratio                        0.00    0.00    0.00
+    L2 Compression Input Sectors      sector    0.00    0.00    0.00
+    L2 Hit Rate                            %    0.43    0.43    0.43
+    Mem Pipes Busy                         %    2.82    2.82    2.82
+    ---------------------------- ----------- ------- ------- -------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------- ------- -------
+    Metric Name                     Metric Unit Minimum Maximum Average
+    ------------------------------- ----------- ------- ------- -------
+    Block Limit SM                        block   24.00   24.00   24.00
+    Block Limit Registers                 block    4.00    4.00    4.00
+    Block Limit Shared Mem                block    7.00    7.00    7.00
+    Block Limit Warps                     block    3.00    3.00    3.00
+    Theoretical Active Warps per SM        warp   48.00   48.00   48.00
+    Theoretical Occupancy                     %  100.00  100.00  100.00
+    Achieved Occupancy                        %   89.75   89.75   89.75
+    Achieved Active Warps Per SM           warp   43.08   43.08   43.08
+    ------------------------------- ----------- ------- ------- -------
+
+  void unrolled_elementwise_kernel<direct_copy_kernel_cuda(TensorIteratorBase &)::[lambda() (instance 3)]::operator ()() const::[lambda() (instance 7)]::operator ()() const::[lambda(float) (instance 1)], std::array<char *, 2>, 4, TrivialOffsetCalculator<1, unsigned int>, TrivialOffsetCalculator<1, unsigned int>, memory::LoadWithCast<1>, memory::StoreWithCast<1>>(int, T1, T2, T4, T5, T6, T7) (16384, 1, 1)x(128, 1, 1), Device 0, CC 8.9, Invocations 1
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- --------- --------- ---------
+    Metric Name             Metric Unit   Minimum   Maximum   Average
+    ----------------------- ----------- --------- --------- ---------
+    DRAM Frequency                  Ghz      8.19      8.19      8.19
+    SM Frequency                    Ghz      1.54      1.54      1.54
+    Elapsed Cycles                cycle 310776.00 310776.00 310776.00
+    Memory Throughput                 %     82.79     82.79     82.79
+    DRAM Throughput                   %     82.79     82.79     82.79
+    Duration                         us    201.22    201.22    201.22
+    L1/TEX Cache Throughput           %     31.13     31.13     31.13
+    L2 Cache Throughput               %     27.12     27.12     27.12
+    SM Active Cycles              cycle 324815.17 324815.17 324815.17
+    Compute (SM) Throughput           %     39.79     39.79     39.79
+    ----------------------- ----------- --------- --------- ---------
+
+    Section: Memory Workload Analysis
+    ---------------------------- ----------- ------- ------- -------
+    Metric Name                  Metric Unit Minimum Maximum Average
+    ---------------------------- ----------- ------- ------- -------
+    Memory Throughput                Gbyte/s  216.99  216.99  216.99
+    Mem Busy                               %   18.32   18.32   18.32
+    Max Bandwidth                          %   82.79   82.79   82.79
+    L1/TEX Hit Rate                        %    0.00    0.00    0.00
+    L2 Compression Success Rate            %    0.00    0.00    0.00
+    L2 Compression Ratio                        0.00    0.00    0.00
+    L2 Compression Input Sectors      sector    0.00    0.00    0.00
+    L2 Hit Rate                            %   63.36   63.36   63.36
+    Mem Pipes Busy                         %   18.32   18.32   18.32
+    ---------------------------- ----------- ------- ------- -------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------- ------- -------
+    Metric Name                     Metric Unit Minimum Maximum Average
+    ------------------------------- ----------- ------- ------- -------
+    Block Limit SM                        block   24.00   24.00   24.00
+    Block Limit Registers                 block   16.00   16.00   16.00
+    Block Limit Shared Mem                block   32.00   32.00   32.00
+    Block Limit Warps                     block   12.00   12.00   12.00
+    Theoretical Active Warps per SM        warp   48.00   48.00   48.00
+    Theoretical Occupancy                     %  100.00  100.00  100.00
+    Achieved Occupancy                        %   94.09   94.09   94.09
+    Achieved Active Warps Per SM           warp   45.16   45.16   45.16
+    ------------------------------- ----------- ------- ------- -------
+
+  void vectorized_elementwise_kernel<4, float16_copy_kernel_cuda(TensorIteratorBase &)::[lambda(float) (instance 1)], std::array<char *, 2>>(int, T2, T3) (8192, 1, 1)x(128, 1, 1), Device 0, CC 8.9, Invocations 1
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- --------- --------- ---------
+    Metric Name             Metric Unit   Minimum   Maximum   Average
+    ----------------------- ----------- --------- --------- ---------
+    DRAM Frequency                  Ghz      8.19      8.19      8.19
+    SM Frequency                    Ghz      1.54      1.54      1.54
+    Elapsed Cycles                cycle 280558.00 280558.00 280558.00
+    Memory Throughput                 %     95.77     95.77     95.77
+    DRAM Throughput                   %     95.77     95.77     95.77
+    Duration                         us    181.63    181.63    181.63
+    L1/TEX Cache Throughput           %     21.18     21.18     21.18
+    L2 Cache Throughput               %     25.61     25.61     25.61
+    SM Active Cycles              cycle 265774.21 265774.21 265774.21
+    Compute (SM) Throughput           %      5.10      5.10      5.10
+    ----------------------- ----------- --------- --------- ---------
+
+    Section: Memory Workload Analysis
+    ---------------------------- ----------- ------- ------- -------
+    Metric Name                  Metric Unit Minimum Maximum Average
+    ---------------------------- ----------- ------- ------- -------
+    Memory Throughput                Gbyte/s  250.96  250.96  250.96
+    Mem Busy                               %   23.73   23.73   23.73
+    Max Bandwidth                          %   95.77   95.77   95.77
+    L1/TEX Hit Rate                        %    0.00    0.00    0.00
+    L2 Compression Success Rate            %    0.00    0.00    0.00
+    L2 Compression Ratio                        0.00    0.00    0.00
+    L2 Compression Input Sectors      sector    0.00    0.00    0.00
+    L2 Hit Rate                            %   33.37   33.37   33.37
+    Mem Pipes Busy                         %    5.10    5.10    5.10
+    ---------------------------- ----------- ------- ------- -------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------- ------- -------
+    Metric Name                     Metric Unit Minimum Maximum Average
+    ------------------------------- ----------- ------- ------- -------
+    Block Limit SM                        block   24.00   24.00   24.00
+    Block Limit Registers                 block   16.00   16.00   16.00
+    Block Limit Shared Mem                block   32.00   32.00   32.00
+    Block Limit Warps                     block   12.00   12.00   12.00
+    Theoretical Active Warps per SM        warp   48.00   48.00   48.00
+    Theoretical Occupancy                     %  100.00  100.00  100.00
+    Achieved Occupancy                        %   91.90   91.90   91.90
+    Achieved Active Warps Per SM           warp   44.11   44.11   44.11
+    ------------------------------- ----------- ------- ------- -------
+
+  void vectorized_elementwise_kernel<4, void unnamed>::pow_tensor_scalar_kernel_impl<float, float>(TensorIteratorBase &, T2)::[lambda(float) (instance 1)], std::array<char *, 2>>(int, T2, T3) (8192, 1, 1)x(128, 1, 1), Device 0, CC 8.9, Invocations 1
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- --------- --------- ---------
+    Metric Name             Metric Unit   Minimum   Maximum   Average
+    ----------------------- ----------- --------- --------- ---------
+    DRAM Frequency                  Ghz      8.19      8.19      8.19
+    SM Frequency                    Ghz      1.54      1.54      1.54
+    Elapsed Cycles                cycle 379272.00 379272.00 379272.00
+    Memory Throughput                 %     89.84     89.84     89.84
+    DRAM Throughput                   %     89.84     89.84     89.84
+    Duration                         us    245.54    245.54    245.54
+    L1/TEX Cache Throughput           %     26.89     26.89     26.89
+    L2 Cache Throughput               %     37.51     37.51     37.51
+    SM Active Cycles              cycle 290288.88 290288.88 290288.88
+    Compute (SM) Throughput           %      3.66      3.66      3.66
+    ----------------------- ----------- --------- --------- ---------
+
+    Section: Memory Workload Analysis
+    ---------------------------- ----------- ------- ------- -------
+    Metric Name                  Metric Unit Minimum Maximum Average
+    ---------------------------- ----------- ------- ------- -------
+    Memory Throughput                Gbyte/s  235.48  235.48  235.48
+    Mem Busy                               %   37.51   37.51   37.51
+    Max Bandwidth                          %   89.84   89.84   89.84
+    L1/TEX Hit Rate                        %    0.00    0.00    0.00
+    L2 Compression Success Rate            %    0.00    0.00    0.00
+    L2 Compression Ratio                        0.00    0.00    0.00
+    L2 Compression Input Sectors      sector    0.00    0.00    0.00
+    L2 Hit Rate                            %   50.03   50.03   50.03
+    Mem Pipes Busy                         %    3.66    3.66    3.66
+    ---------------------------- ----------- ------- ------- -------
+
+    Section: Occupancy
+    ------------------------------- ----------- ------- ------- -------
+    Metric Name                     Metric Unit Minimum Maximum Average
+    ------------------------------- ----------- ------- ------- -------
+    Block Limit SM                        block   24.00   24.00   24.00
+    Block Limit Registers                 block   16.00   16.00   16.00
+    Block Limit Shared Mem                block   32.00   32.00   32.00
+    Block Limit Warps                     block   12.00   12.00   12.00
+    Theoretical Active Warps per SM        warp   48.00   48.00   48.00
+    Theoretical Occupancy                     %  100.00  100.00  100.00
+    Achieved Occupancy                        %   84.16   84.16   84.16
+    Achieved Active Warps Per SM           warp   40.40   40.40   40.40
+    ------------------------------- ----------- ------- ------- -------
+
+  Note: The shown averages are calculated as the arithmetic mean of the metric values after the evaluation of the    
+  metrics for each individual kernel launch.                                                                         
+  If aggregating across varying launch configurations (like shared memory, cache config settings), the arithmetic    
+  mean can be misleading and looking at the individual results is recommended instead.                               
+  This output mode is backwards compatible to the per-kernel summary output of nvprof                                
+

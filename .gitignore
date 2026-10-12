@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# PyTorch C++/CUDA 扩展的编译产物（torch.utils.cpp_extension）
+torch_extensions/
+*.so
+*.o
+*.cubin
+*.ptx
+*.fatbin
+
+# Nsight 报告（体积大，按需单独上传）
+*.ncu-rep
+*.nsys-rep
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
