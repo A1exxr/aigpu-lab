@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import shutil
 import sys
@@ -71,6 +72,35 @@ def ref_fused_rmsnorm_residual(x, residual, w, eps=1e-6):
     h = x + residual
     return ref_rmsnorm(h, w, eps)
 
+# w2_reduce.cu
+def ref_reduce(x):
+    return x.sum()
+
+
+def ref_attn_naive(Q, K, V):
+    """w4_attn_naive.cu 的参考实现。
+
+    用 PyTorch 的 SDPA，但**显式按 naive 的数学写一遍**更稳妥（SDPA 可能走
+    flash/mem-efficient 后端，数值上等价但实现不同）。这里用显式公式：
+
+        S = Q @ K.transpose(-1, -2) / sqrt(D)
+        P = softmax(S, dim=-1)
+        O = P @ V
+
+    全程在 fp32 里算，最后转回输入 dtype，避免 fp16 中间结果把 1e-2 的
+    容差吃满。
+    """
+    d = Q.size(-1)
+    scale = 1.0 / math.sqrt(d)
+    q = Q.float()
+    k = K.float()
+    v = V.float()
+    s = torch.matmul(q, k.transpose(-1, -2)) * scale
+    p = torch.softmax(s, dim=-1)
+    return torch.matmul(p, v).to(Q.dtype)
+
+
+
 
 # ---------------------------------------------------------------------------
 # 规格定义
@@ -107,6 +137,7 @@ class KernelSpec:
 
 RMSNORM_HP = (1, 2048, 4096)
 
+REDUCE_HP = (4194304,)  # w2_reduce.cu
 
 def _rmsnorm_inputs(shape, dtype, device):
     x = torch.randn(*shape, device=device, dtype=dtype)
@@ -197,6 +228,90 @@ REGISTRY: list[KernelSpec] = [
                 # 融合版：读 x + 读 r + 写 out = 3N；分步版要多一轮 = 5N
                 nbytes=lambda s, d: 3 * workloads.numel(s) * workloads.elem_bytes(d),
                 flops=lambda s, d: 7.0 * workloads.numel(s),
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="two_step_rmsnorm_residual",
+        cuda_file="kernels/w3_fused_rmsnorm_residual.cu",
+        cpp_signature=(
+            "torch::Tensor two_step_rmsnorm_residual("
+            "torch::Tensor x, torch::Tensor residual, torch::Tensor w, double eps);"
+        ),
+        functions=["two_step_rmsnorm_residual"],
+        note="W3：分步对照版（add + rmsnorm，两个 kernel），h 读两遍 = 6N",
+        cases=[
+            Case(
+                label="(1,2048,4096) fp16",
+                shape=RMSNORM_HP, dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "x": torch.randn(*s, device=dev, dtype=d),
+                    "r": torch.randn(*s, device=dev, dtype=d),
+                    "w": torch.randn(s[-1], device=dev, dtype=d),
+                },
+                cuda_call=lambda mod, inp: mod.two_step_rmsnorm_residual(
+                    inp["x"], inp["r"], inp["w"], 1e-6),
+                ref_call=lambda inp: ref_fused_rmsnorm_residual(
+                    inp["x"], inp["r"], inp["w"]),
+                # 分步且 h 读两遍：读 x + 读 r + 写 h + 读 h + 读 h + 写 out = 6N
+                nbytes=lambda s, d: 6 * workloads.numel(s) * workloads.elem_bytes(d),
+                flops=lambda s, d: 7.0 * workloads.numel(s),
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="reduce",
+        cuda_file="kernels/w2_reduce.cu",
+        cpp_signature=("torch::Tensor reduce_sum(torch::Tensor x);"),
+        functions=["reduce_sum"],
+        note="W2:归约练习——树形归约 + 合并访存",
+        cases=[
+            Case(
+                label= "(4194304,) fp32",
+                shape=REDUCE_HP,
+                dtype="fp32",
+                make_inputs=lambda s, d, dev:{
+                    "x": torch.rand(*s, device=dev, dtype=d),
+                },
+                cuda_call = lambda mod, inp: mod.reduce_sum(inp["x"]),
+                ref_call = lambda inp:      ref_reduce(inp["x"]),
+                nbytes=lambda s, d: workloads.bytes_elementwise(s, d, 1, 0)
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="attn_naive",
+        cuda_file="kernels/w4_attn_naive.cu",
+        cpp_signature=(
+            "torch::Tensor attn_naive("
+            "torch::Tensor Q, torch::Tensor K, torch::Tensor V);"
+        ),
+        functions=["attn_naive"],
+        note="W4：naive attention（QKᵀ → softmax → PV 三个 kernel，S² 落显存）。"
+             "基线：预期 4~6 ms、带宽 ~20%，用来证明 memory-bound + 给 w5 flash 当分母",
+        cases=[
+            Case(
+                label="(4,8,1024,64) fp16",
+                shape=(4, 8, 1024, 64),
+                dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "Q": torch.randn(*s, device=dev, dtype=d),
+                    "K": torch.randn(*s, device=dev, dtype=d),
+                    "V": torch.randn(*s, device=dev, dtype=d),
+                },
+                cuda_call=lambda mod, inp: mod.attn_naive(
+                    inp["Q"], inp["K"], inp["V"]),
+                ref_call=lambda inp: ref_attn_naive(
+                    inp["Q"], inp["K"], inp["V"]),
+                # naive 的流量：Q/K/V/O 各 S*D（4 个），S_mat/P 的 4 次往返各 S*S
+                #   → 每个 (b,h) 共 4*S*D + 4*S*S 个元素
+                # 注意这是「算法流量」，实测用 ncu 的 dram__bytes 对照
+                nbytes=lambda s, d: (
+                    (4 * s[2] * s[3] + 4 * s[2] * s[2]) * s[0] * s[1]
+                    * workloads.elem_bytes(d)
+                ),
+                # QKᵀ: 2*S²*D，PV: 2*S²*D，每个 (b,h)
+                flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[2] * s[3],
             ),
         ],
     ),

@@ -51,11 +51,63 @@ __global__ void rmsnorm_kernel(const half* __restrict__ x,
                                const int rows,
                                const int cols,
                                const float eps) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long long n = (long long)rows * cols;
-    if (i < n) {
-        out[i] = x[i];          // ← 占位。你要把这行换成真正的 RMSNorm
+    const int row = blockIdx.x;      // 一个block负责一行，block内的thread负责
+    const int tid = threadIdx.x;     // thread的块内x索引
+
+    // 计算每一行的各线程的平方和
+    // x[rows, cols]     输入形状                                   x:   [B, T, 4096]     # 比如 batch × seq_len × hidden
+    // w[cols]           权重形状，只作用于最后一维                   w:   [4096]           # 只对最后一维做归一化
+    // out[rows, cols]   输出，和输入同形状                          out: [B, T, 4096]     # 和 x 形状相同
+    float local = 0.f;
+    // 每个线程从自己的 tid 开始，不是0，按 blockDim.x 步长跳跃，这样线程之间不会重叠，合起来覆盖整行
+    for(int c = tid; c < cols; c += blockDim.x)
+    {
+        float b = __half2float(x[row * cols + c]);
+        // 每个线程通过tid来累加属于自己要处理的元素
+        local += b * b;
     }
+    // 声明一个共享内存，大小为 线程数
+    // float sdata[cols];    // 错误写法，这是局部数组，不是共享内存
+    __shared__ float sdata[256];        // 定义了block=256，一个block有256个线程
+    sdata[tid] = local;                 // 每个线程都把自己累加后的值放进去
+    // 在 sdata[tid] = local; 之后、归约之前，需要一次同步，保证所有线程都写完了自己的部分和  我忘记写了
+    __syncthreads();
+    
+    // 同步后，sdata[]里面就是一个 block 的 各线程 的累加和，因为一个 block 管理一行，所以进行归约，加起来得到一行的加和
+    // 通过归约 计算 每一行的和
+    for(int i = blockDim.x / 2; i > 0 ; i >>= 1)            // i >>= 1   i 除以 2 向下取整
+    {
+        if(tid < i)
+        {
+            sdata[tid] += sdata[tid + i];
+        }
+        // 归约结束后，sdata 里仍然有 blockDim.x 个元素，只是 sdata[0] 里存的是总和，其他位置是残留的旧值
+        // 每个block都会创建那个共享内存sdata[]，所以每个block规约后，该行的和都在sdata[0]里
+        // 这里要进行同步，让同一个 block 里的所有线程，都执行到这一行之后，才继续往下走
+        __syncthreads();
+    }
+
+    // 现在sdata里面的值就是该block处理的那一行的平方和
+    // 算rms，并广播
+    // 声明一个共享内存 float 类型 数据
+    __shared__ float s_rms;
+    if(tid == 0)
+    {   
+        float mean = sdata[0] / (float)cols;
+        s_rms = rsqrtf(mean + eps);                 // rsqrtf() 先开平方，再取倒数
+    }
+    // 这里需要同步，虽然只有tid=0进行了写操作，但是下面的循环，所有线程都要进行读操作，所以要同步
+    __syncthreads();
+
+    // 进行归一化
+    // 遍历这一行的 列，读取 x 和 w
+    for(int c = tid; c < cols; c += blockDim.x)
+    {
+        float v = __half2float(x[(long long)row * cols + c]);
+        float wv = __half2float(w[c]);
+        out[(long long) row * cols + c] = __float2half(v * s_rms * wv);
+    }
+
 }
 
 // -----------------------------------------------------------------------------
@@ -68,18 +120,23 @@ torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps) {
     TORCH_CHECK(x.scalar_type() == torch::kFloat16, "本骨架只支持 fp16");
     TORCH_CHECK(x.dim() >= 1, "x 至少要有 1 维");
 
+    // 如果 x 本来就连续，就返回x本身，不拷贝
+    // 否则拷贝一份，变成连续内存
     auto xc = x.contiguous();
     auto wc = w.contiguous();
     auto out = torch::empty_like(xc);
 
+    // xc.size(-1)：取最后一维的大小；
+    // 把张量逻辑上展平成 [rows, cols] 的二维矩阵，每一行独立做 RMSNorm
     const int cols = (int)xc.size(-1);
     const int rows = (int)(xc.numel() / cols);
 
     // TODO(你)：想清楚这里的 grid/block 该怎么配。
     // 当前的配置只保证"每个元素都被覆盖到"，不是按行划分的。
     const int threads = 256;
-    const long long total = (long long)xc.numel();
-    const int blocks = (int)((total + threads - 1) / threads);
+    // const long long total = (long long)xc.numel();
+    // const int blocks = (int)((total + threads - 1) / threads);
+    const int blocks = rows;
 
     rmsnorm_kernel<<<blocks, threads>>>(
         reinterpret_cast<const half*>(xc.data_ptr<at::Half>()),
