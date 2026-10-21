@@ -43,7 +43,7 @@ python kernels/bench_kernels.py --only gelu --verbose-build
 | GELU | `kernels/w2_gelu.cu` | **0.1516 ms** | 0.1546 ms | **221.4 GB/s（81.4%）** | memory-bound，已追平 PyTorch |
 | RMSNorm+残差（融合） | `kernels/w3_fused_rmsnorm_residual.cu` | **0.2826 ms** | — | 178.1 GB/s（65.5%，bench） | **DRAM 92.8%**（199.9 µs）→ 到顶 |
 | RMSNorm+残差（两 kernel） | 同上，`two_step_*` | 0.3756 ms | — | 268.0 GB/s（98.5%，6N 口径） | DRAM 91.4% / 65.1% |
-| Attention naive | `kernels/w4_attn_naive.cu` | 46.87 ms | 4.41 ms | 6.1 GB/s（2.2%） | 未到 DRAM 瓶颈，卡在 L1 扇区吞吐 |
+| Attention naive（3 kernel） | `kernels/w4_attn_naive.cu` | **15.53 ms**（首版 46.87） | 4.41 ms | 18.4 GB/s（6.8%） | 卡在 L1 扇区 + 指令发射，未到 DRAM（残余瓶颈需 tiling） |
 
 > **口径说明**：`有效带宽 = 算法流量 ÷ 时间`，分母用 272 GB/s（标称）。
 > 实测天花板是 **221 GB/s**（平凡 `scale` kernel 打出来的数）。
@@ -82,8 +82,8 @@ two_step（2 个 kernel）0.3756 ms   6N = 96 MiB   →  ncu 390.0 µs
 **③ Attention naive 慢 45 倍，卡在一个 6.25%**
 
 ```
-我 46.87 ms  vs  torch SDPA 4.41 ms     理论下限 1.05 ms（272 MiB ÷ 272 GB/s）
-profiler 拆解：QKᵀ 34.3 ms / PV 10.5 ms / softmax 0.6 ms
+首版 46.87 ms  vs  torch SDPA 4.41 ms     理论下限 1.05 ms（272 MiB ÷ 272 GB/s）
+profiler 拆解（首版）：QKᵀ 34.3 ms / PV 10.5 ms / softmax 0.6 ms
 ```
 
 QKᵀ kernel 里，warp 内相邻线程读 `K + j*D + d`，**地址间隔 D×2 = 128 B**——
@@ -96,6 +96,23 @@ QKᵀ kernel 里，warp 内相邻线程读 `K + j*D + d`，**地址间隔 D×2 =
 
 改法：`j` 绑 `warp_id`、`d` 绑 `lane`，一个 warp 认领一行，load 覆盖 128 B 连续地址，
 再用 5 轮 `__shfl_down_sync` 归约。**瓶颈从"L1 扇区吞吐"转移到"指令发射"。**
+
+### 三轮优化：46.87 ms → 15.53 ms（3.02×）
+
+| 版本 | QKᵀ | PV | softmax | 合计 | 做了什么 |
+|---|---|---|---|---|---|
+| v1 逐线程算 j | 34.31 | 10.55 | 0.61 | 45.46 | 一个线程算一整行点积（分工本身就错） |
+| v2 warp-per-j | 14.79 | 11.10 | 0.62 | 26.51 | `j` 绑 `warp_id`、`d` 绑 `lane`；扇区利用率 6.25% → 100% |
+| v3 PV 四路切 j | 16.02 | **5.37** | 0.81 | 22.20 | 输出只有 64 维 → 只有 64/256 线程有活；按 j 切 4 段 + 共享内存归约 |
+| **v4 QK 加 ILP-4** | **≈9.4** | 5.37 | 0.81 | **15.53** | 4 个独立累加器交错，掩盖 5 轮 shuffle 的串行延迟 |
+
+> 时间单位 ms，来自 `torch.profiler` 的 `Self CUDA` 折算（v1 为总量 46.87 ms 时的拆解，
+> v4 的 QK 由 `15.53 − 5.37 − 0.81` 反推）。合计与 bench 的 `[PASS] 15.5290 ms` 一致。
+
+**为什么停在这里**：剩下的瓶颈是 PV —— 每一行都要把整个 `V`（1024×64）读一遍，
+按行切分无法复用。唯一出路是把 Q/K/V 分块送进共享内存、块内做 online softmax，
+也就是 FlashAttention。这一步不在 naive 版本里硬凑，留给 `w5_flash_attn.py`（Triton）。
+
 
 **④ Softmax 的屏障成本：20 次 → 4 次**
 
@@ -178,7 +195,7 @@ S=16384 时标准实现吃掉 96% 的显存，**勉强没 OOM**，但延迟暴�
 > 同一个 29.1 TFLOPS 的 matmul，"利用率"会在 **38% ~ 50%** 之间乱跳。
 
 写 kernel 过程中踩的坑（编译错误、静默错误、性能反直觉）逐条记在
-[`kernels/CUDA错题本.md`](kernels/CUDA错题本.md)（约 1500 行、50 条），
+[`kernels/CUDA错题本.md`](kernels/CUDA错题本.md)（约 1700 行、63 条），
 ncu 用法与"怎么判瓶颈"记在 [`kernels/ncu速查.md`](kernels/ncu速查.md)。
 
 ---
@@ -246,7 +263,8 @@ ncu --clock-control none --set full -c 1 \
 - **单卡，没有多卡 / 分布式经验。** 训练侧（Deepspeed / Megatron / 张量并行）没有实机验证过。
 - **笔记本 GPU 的持续频率受功耗墙与散热影响**，绝对延迟不具备跨机器可比性；
   可比的是**加速比**与**带宽利用率**。
-- **Attention 目前只有 naive 版本**（正在重构成 warp-per-j）；FlashAttention 的 Triton 实现进行中。
+- **Attention 目前只有 naive 三 kernel 版本**（已从 46.87 ms 优化到 15.53 ms：warp-per-j + PV 四路切分 + QK 的 ILP-4）；FlashAttention 的 Triton 前向实现进行中。
+- **naive attention 的带宽利用率只有 6.8%**，不是测错：S² 矩阵要落显存四次往返，瓶颈在指令发射与 L1 扇区而非 HBM。它存在的意义是当 FlashAttention 的分母。
 - **bench 与 ncu 两把尺子差 40%，原因未定论**（已排除降频/入队/分配器），见上方口径说明。
 - 精度实验上限是 FP8（Ada 不支持 FP4）。
 
