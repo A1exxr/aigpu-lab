@@ -223,7 +223,8 @@ ncu 用法与"怎么判瓶颈"记在 [`kernels/ncu速查.md`](kernels/ncu速查.
 │   ├── w4_attn_naive.cu         naive attention（QKᵀ / softmax / PV 三个 kernel）
 │   ├── CUDA错题本.md            50 条真实错误与修正
 │   ├── ncu速查.md               ncu 命令、指标含义、存储分级、怎么判瓶颈
-│   └── attention入门-从公式到显存流量.md   attention 的流量账与 FlashAttention 动机
+│   ├── attention入门-从公式到显存流量.md   attention 的流量账与 FlashAttention 动机
+│   └── flash-attention详解.md      FlashAttention 原理、online softmax 推导、流量与 AI 逐项算账
 ├── docs/                      开发说明、README 模板、博客草稿
 └── results/                   实测报告、原始数据、图表、ncu 剖面摘录
 ```
