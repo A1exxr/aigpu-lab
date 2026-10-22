@@ -63,7 +63,7 @@ def _flash_attn_kernel(Q, K, V, O,
 def flash_attn(q, k, v):
     B, H, S, D = q.shape
     o = torch.empty_like(q)
-    Block_m, Block_n = 64, 64
+    Block_m, Block_n = 64, 128
     grid = (triton.cdiv(S, Block_m), B * H)         # 每个 program 负责：一个 Q 块 × 一个 (b,h)
 
     _flash_attn_kernel[grid](q, k, v, o,
@@ -72,7 +72,8 @@ def flash_attn(q, k, v):
                              v.stride(1), v.stride(2), v.stride(3),
                              o.stride(1), o.stride(2), o.stride(3),
                              S, (1.0 / D ** 0.5),
-                             Block_m, Block_n, D=D)     # ← D 作为 constexpr 关键字传入
+                             Block_m, Block_n, D=D,     #  D 作为 constexpr 关键字传入
+                             num_warps=4, num_stages=2)     
     return o
 
 

@@ -44,7 +44,7 @@ python kernels/bench_kernels.py --only gelu --verbose-build
 | RMSNorm+残差（融合） | `kernels/w3_fused_rmsnorm_residual.cu` | **0.2826 ms** | — | 178.1 GB/s（65.5%，bench） | **DRAM 92.8%**（199.9 µs）→ 到顶 |
 | RMSNorm+残差（两 kernel） | 同上，`two_step_*` | 0.3756 ms | — | 268.0 GB/s（98.5%，6N 口径） | DRAM 91.4% / 65.1% |
 | Attention naive（3 kernel） | `kernels/w4_attn_naive.cu` | **15.53 ms**（首版 46.87） | 4.41 ms | 18.4 GB/s（6.8%） | 卡在 L1 扇区 + 指令发射，未到 DRAM（残余瓶颈需 tiling） |
-| FlashAttention（Triton） | `kernels/w5_flash_attn.py` | **0.494 ms** | 0.435 ms（SDPA） | 不适用，见下 | **17.4 TFLOPS（26.7% fp16 峰值）** → 比 naive 快 **31.5×**，达 SDPA 的 **88%** |
+| FlashAttention（Triton） | `kernels/w5_flash_attn.py` | **0.474 ms** | 0.432 ms（SDPA） | 不适用，见下 | **18.1 TFLOPS（27.8% fp16 峰值）** → 比 naive 快 **32.8×**，达 SDPA 的 **91%** |
 
 > **口径说明**：`有效带宽 = 算法流量 ÷ 时间`，分母用 272 GB/s（标称）。
 > 实测天花板是 **221 GB/s**（平凡 `scale` kernel 打出来的数）。
@@ -54,8 +54,10 @@ python kernels/bench_kernels.py --only gelu --verbose-build
 
 > **FlashAttention 的带宽口径不一样**：它不把 S² 矩阵写出显存，所以「4SD + 4S²」的算法流量公式不适用。
 > 套上去会算出 578 GB/s（212% 峰值）——**这本身就是公式用错的判据**。
-> 真实账：DRAM 只走 Q/K/V/O 共 `4·S·D` 字节 = 16 MiB（K/V 被 16 个 Q 块重读，但 8 MiB 常驻 L2），
-> 因此这块 kernel 是 **compute-bound**：8.59 GFLOP ÷ 0.494 ms = **17.4 TFLOPS**，FLOPS 利用率 **26.7%**。
+> 真实账：DRAM 只走 Q/K/V/O 共 `4·S·D` 字节 = 16 MiB → **35.4 GB/s（13.0%）**，
+> 因此这块 kernel 是 **compute-bound**：8.59 GFLOP ÷ 0.474 ms = **18.1 TFLOPS（27.8% 峰值）**。
+> 反向验证：若 K/V 的 16 次重读全部打到 DRAM，需要 `34·S·D` = 142 MiB → 300 GB/s，
+> 超过本机实测天花板 221 GB/s —— 物理上不可能，说明 8 MiB 的 K/V 常驻 L2。
 
 ### 四个能讲的故事
 
@@ -272,8 +274,10 @@ ncu --clock-control none --set full -c 1 \
 - **笔记本 GPU 的持续频率受功耗墙与散热影响**，绝对延迟不具备跨机器可比性；
   可比的是**加速比**与**带宽利用率**。
 - **Attention 有 naive 与 FlashAttention 两版**：naive 三 kernel 从 46.87 ms 优化到 15.53 ms（warp-per-j + PV 四路切分 + QK 的 ILP-4）；
-  FlashAttention（Triton，online softmax）**0.494 ms = naive 的 1/31，达 PyTorch SDPA 的 88%**。
-- **FlashAttention 只支持 `head_dim ≤ 64`、无 causal mask**；下一步收益在 `Block_m=128`、`num_warps=8`、`num_stages=3` 的调参，以及把 `p` 的累加改成 `float32` 后的指令级优化。
+  FlashAttention（Triton，online softmax）**0.474 ms = naive 的 1/32.8，达 PyTorch SDPA 的 91%**。
+- **FlashAttention 的调参结论**（24 组扫描）：`Block_m=64 / Block_n=128 / num_warps=4 / num_stages=2`
+  从 0.580 ms 降到 0.474 ms；`num_warps=8` 会掉到 0.87 ms（每 warp 只剩 8 行，喂不饱 Tensor Core 的最小 mma 粒度）。
+- **FlashAttention 只支持 `head_dim ≤ 64`、无 causal mask**；再往上的收益需要 `p` 保持 fp32 的指令级优化与 split-K 并行。
 - **naive attention 的带宽利用率只有 6.8%**，不是测错：S² 矩阵要落显存四次往返，瓶颈在指令发射与 L1 扇区而非 HBM。它存在的意义是当 FlashAttention 的分母。
 - **bench 与 ncu 两把尺子差 40%，原因未定论**（已排除降频/入队/分配器），见上方口径说明。
 - 精度实验上限是 FP8（Ada 不支持 FP4）。
