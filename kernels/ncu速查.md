@@ -328,7 +328,196 @@ FlashAttention:   AI = S/2               →  S 越大 AI 越高（S=1024 → 51
 | AI 只看算法吗 | 是。代码只影响实际带宽能多接近峰值 |
 | 减字节有什么用 | 直接抬高 AI，把瓶颈从带宽转到算力（融合就是这么起效的） |
 
-## 9. 一页总结（记这 6 句）
+## 9. 访存粒度：cache line（128 B）vs sector（32 B）
+
+### 9.1 两个概念不是一回事
+
+| 概念 | 大小 | 作用 |
+|---|---|---|
+| **cache line** | 128 B | **管理 / 查表单位**：L1 里每个槽位记一条 line 的地址高位（tag）。查表、命中判断按 line 走 |
+| **sector** | 32 B | **搬运单位**：L2 ↔ L1、DRAM ↔ L2 真正搬的最小粒度。**1 line = 4 sector** |
+
+为什么还要 line：tag 按 line 存，如果按 sector 存，tag 数量 ×4，硬件成本爆炸。所以「用 line 查表，用 sector 搬数据」。
+
+### 9.2 sectored cache：只搬被碰到的那个 sector
+
+现代 NVIDIA GPU 是 **sectored** 的：一条 128 B line 里，哪个 32 B sector 被访问了，才把那个 sector 拉上来，其余 3 个原地不动。
+
+```
+一条 line：
+┌─────────┬─────────┬─────────┬─────────┐
+│sector 0 │sector 1 │sector 2 │sector 3 │  共 128 B
+│  32 B   │  32 B   │  32 B   │  32 B   │
+└─────────┴─────────┴─────────┴─────────┘
+      ↑
+   只碰了这 2 B → 只有 sector 0 被搬
+```
+
+类比：line 是一排 4 格快递柜，sector 是其中一格。你只买了 1 格里的东西，快递员只开那一格，不会把整排 4 格都搬来。
+
+### 9.3 两种口径算浪费率（w4 `qk_kernel` 旧版为例）
+
+访问方式：32 个线程各读 2 B（fp16），地址彼此间隔 128 B → 落在 32 条不同 line 上。
+
+| 口径 | 算式 | 结果 |
+|---|---|---|
+| A. 按 **line** 算 | 32 条 line × 128 B = 4096 B；有用 32 × 2 = 64 B | **1.56%** |
+| B. 按 **sector** 算 | 32 条 line × 1 个 sector × 32 B = 1024 B；有用 64 B | **6.25%** |
+
+- **DRAM 带宽按 sector 计** → 真实浪费率是 **6.25%**，不是 1.56%。
+- 1.56% 只在「非 sectored cache / 整 line 预取 / 写-分配」这几种情况下才对，现代 GPU 读路径不是这样。
+- 面试说法：「按 32 B sector 粒度算，有效字节只有 6.25%」——点出粒度会加分。
+
+### 9.4 通用判据：sectors / request
+
+```
+理想 sectors/request = 每线程访问的字节数（因为 32 线程 × N 字节 / 32 B = N）
+```
+
+| 每线程访问 | 合并后的 warp 请求 | sectors/request | 有效字节 |
+|---|---|---|---|
+| fp16 × 1 个（2 B） | 64 B 连续 | **2** | 100% |
+| fp32 × 1 个（4 B） | 128 B 连续 | **4** | 100% |
+| fp16 × 2 个（half2，4 B） | 128 B 连续 | **4** | 100% |
+| w4 旧版 qk（跨 32 条 line） | 32 条不同 line | **32** | 6.25% |
+
+**结论：sectors/request 越接近「每线程字节数」越好；远超它说明访存没合并。**
+
+### 9.5 在 ncu 里量
+
+```bash
+ncu --metrics \
+l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,\
+l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum \
+python your_script.py
+```
+
+- `requests` = warp 一共发出几次 load
+- `sectors` = 实际搬了多少个 32 B
+- 两者相除就是上表的 sectors/request
+- 还有 `l1tex__t_sectors_pipe_lsu_mem_global_op_st.sum`（写）、`lts__t_sectors_op_read.sum`（L2 读，看 sector 有没有被重复搬）
+
+### 9.6 三句话
+
+1. **line = 128 B，管查表；sector = 32 B，管搬数据。**
+2. 浪费率按 sector 算：w4 旧版 qk 是 **6.25%**，不是 1.56%。
+3. 判合并好不好看 **sectors/request**，理想值 = 每线程字节数（fp16 单元素 = 2，fp32 或 half2 = 4）。
+
+## 10. ILP（指令级并行）：为什么「一次多算几个」反而更快
+
+### 10.1 一句话
+
+**ILP = 让同一个线程里有多条互不依赖的指令同时在飞。** 处理器不必等上一条算完，就能发下一条。
+
+### 10.2 反例：串行依赖链（qk 的第一版）
+
+```cuda
+acc += __shfl_down_sync(0xffffffff, acc, 16);   // 用 acc，产出 acc
+acc += __shfl_down_sync(0xffffffff, acc, 8);    // 必须等上一轮
+acc += __shfl_down_sync(0xffffffff, acc, 4);
+acc += __shfl_down_sync(0xffffffff, acc, 2);
+acc += __shfl_down_sync(0xffffffff, acc, 1);
+```
+
+5 轮全是「必须排队」的操作，每轮延迟 20–30 周期 → 一个 warp 每算一个 j 就要干等 **100–150 周期**，而它只有约 20 条指令可发 → 发射效率约 **16%**。
+
+### 10.3 正例：4 条互不依赖的链
+
+```cuda
+float a0, a1, a2, a3;              // 4 个不同 j 的部分和，互不依赖
+a0 += __shfl_down_sync(0xffffffff, a0, 16);
+a1 += __shfl_down_sync(0xffffffff, a1, 16);   // ← 不用等 a0，立刻能发
+a2 += __shfl_down_sync(0xffffffff, a2, 16);
+a3 += __shfl_down_sync(0xffffffff, a3, 16);
+```
+
+a0 在等结果时，调度器去发 a1/a2/a3 → 原本的空洞被填上。
+
+### 10.4 延迟 vs 吞吐（这句要背）
+
+- **延迟（latency）**：一条指令从发出到结果可用要多久。shuffle ≈ 20–30 周期；HBM ≈ 400–600 周期
+- **吞吐（throughput）**：单位时间能发多少条
+- 只有 1 条链 → 只能「等延迟」，吞吐上不去
+- 多条独立链 → 用「别人在等」的时间发别人的指令 → **把延迟隐藏成吞吐**
+
+### 10.5 发射效率怎么算
+
+```
+发射效率 = 理论最短时间 ÷ 实测时间
+理论最短时间 = warp 指令总数 ÷ (SM 数 × 每 SM 调度器数 × 主频)
+```
+
+RTX 4060 Laptop：24 SM × 4 调度器 × 2.655 GHz ≈ **255G 条 warp 指令/秒**
+
+qk 实测：670M 条 ÷ 255G ≈ 2.6 ms 理论，实测 16 ms → **效率 16%**
+
+### 10.6 ILP 的代价
+
+- 每条「在飞的链」要占一个累加器寄存器 → 4 条链 = 4 个累加器 + 4 份地址计算
+- 寄存器涨 → occupancy 可能掉 → 又和 §11 打架
+- 经验：ILP 2–4 最划算，8 以上一般开始掉
+
+---
+
+## 11. 寄存器、Occupancy、MIO：三个总被问到的概念
+
+### 11.1 寄存器多少算多？
+
+不看绝对值，看**能不能装满 SM**：
+
+```
+每 SM 寄存器总数（Ada）= 65536 个（32-bit）
+每 SM 最大常驻线程     = 1536
+⇒ 想 100% occupancy：每线程 ≤ 65536 ÷ 1536 ≈ 42 个
+```
+
+| 每线程寄存器 | 256 线程/block 能装几个 block | occupancy |
+|---|---|---|
+| 32 | 8 | 100% |
+| 40 | 6 | 100%（6×256 = 1536） |
+| **72** | **3** | **50%** |
+| 96 | 2 | 33% |
+
+所以「72 个算多吗」→ 单看不算多（硬件上限 255），但**对 100% occupancy 来说太多**。
+
+### 11.2 怎么降寄存器（按有效度排）
+
+1. 减少同时活着的变量（用完就让它死）
+2. 减小 `#pragma unroll` 的展开倍数
+3. 拆 kernel（一个 kernel 别干三件事）
+4. `__launch_bounds__(256, 6)`：让编译器自己压到能装 6 个 block
+
+❌ **无效做法**：改 block 数 / 改 grid — 寄存器是 **per-thread** 的，跟 block 数量无关。
+
+### 11.3 MIO Throttle 是什么
+
+MIO = Memory Input/Output 队列。**共享内存、shuffle、特殊函数（exp/sin）、部分 L1 访问**都排这条队。队列满了 → 指令发不进去 → 记为 `stall_mio_throttle`。
+
+对应动作：
+- 查共享内存 bank conflict
+- 小规模归约改用 shuffle 而不是共享内存
+- 减少共享内存读写次数（一次读 4 个，而不是读 4 次）
+
+### 11.4 Short / Long Scoreboard 怎么区分
+
+| 指标 | 在等什么 | 说明 |
+|---|---|---|
+| `short_scoreboard` | **片上**（shared memory / L1 / MIO） | 卡在片上 |
+| `long_scoreboard` | **显存**（HBM，或 L2 miss 之后） | 卡在显存 |
+
+这是区分「片上瓶颈」和「显存瓶颈」最快的两个指标。
+
+### 11.5 「L2 挡不挡得住」是什么意思
+
+一次 kernel 发出的读取请求，如果数据还在 L2 里 → **命中，不打 DRAM**；如果已被别的数据挤出去 → **miss，必须回 DRAM**。
+
+所以「挡不挡得住」= **这份数据的重复读取能不能被 L2 吸收**。
+
+qk 的例子：每个 block 读 128 KB 的 `K[b,h]`，共 32768 个 block → 4 GiB 请求；但 `K[b,h]` 只有 128 KB，24 MiB 的 L2 能装 **192** 个（`24×1024÷128 = 192`），所以只要同一 `(b,h)` 的 block 连续执行，就只有第一次 miss。
+
+保证命中的条件：**grid 排布让 `(b,h)` 相同的 block 在时间上连续**——`row = ((b*H + h)*S + i)` 正好满足。
+
+## 12. 一页总结（记这 9 句）
 
 1. 看带宽 = 看 `DRAM Throughput`；和峰值 272 GB/s 比。
 2. 片上 = 寄存器 / 共享内存+L1（SRAM）/ L2；只在 DRAM 没喂满时才查。
@@ -336,3 +525,6 @@ FlashAttention:   AI = S/2               →  S 越大 AI 越高（S=1024 → 51
 4. warp 内部交换优先用 shuffle，比共享内存快且省屏障。
 5. 先确认尺子（bench 循环 vs ncu 单次），再谈优化。
 6. 瓶颈判断的根子是 **AI = FLOPs ÷ 字节**：<239.7 是带宽问题，>239.7 是算力问题。
+7. 浪费率按 **sector（32 B）**算，不是 line（128 B）；合并好坏看 sectors/request 是否等于每线程字节数。
+8. **一次多算几个（ILP）** 是用独立链填 shuffle/访存的延迟洞；发射效率 = 理论时间 ÷ 实测时间。
+9. 寄存器每线程 ≤42 才可能 100% occupancy；`mio_throttle` = 片上队列满，`short_scoreboard` = 等片上，`long_scoreboard` = 等显存。
