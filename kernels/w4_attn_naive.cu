@@ -119,41 +119,91 @@ __global__ void qk_kernel(const half* __restrict__ Q,
         新方法是 一个 warp 算 K 的一行，而是循环处理多个 j                        
     
     */
-    for (int j = tid; j < S; j += blockDim.x) {                     
-        float acc = 0.f;                                            
-        for(int d = 0; d < D; d++)                                  
-        {                                                           
-            acc += q_row[d] * __half2float(K[k_base + j * D + d]);   
-        }
-        S_mat[s_base + j] = __float2half(acc * scale);
-    }
+    // 方法一
+    // for (int j = tid; j < S; j += blockDim.x) {                     
+    //     float acc = 0.f;                                            
+    //     for(int d = 0; d < D; d++)                                  
+    //     {                                                           
+    //         acc += q_row[d] * __half2float(K[k_base + j * D + d]);   
+    //     }
+    //     S_mat[s_base + j] = __float2half(acc * scale);
+    // }
 
-    // 方法二：一个 warp 算 K 的一行， K 一行有 64个元素，
+    // 方法二：一个 warp 读这 K 的 64 个元素，和 q_row 做点积，归约后得到 S_mat 的一个元素（1 个标量）
+    // 但这还是有问题，每一个 warp 只能算一个 S_mat元素，中间要经过5次 shuffle，这5次是串行的，第2轮必须等第1轮的结果
+    // 硬件手上没有别的活可发，只能干等那 20–30 个周期。这就是算出来的 16% 发射效率。
     const int lane = threadIdx.x % 32;
     const int warp_id = threadIdx.x / 32;
+    const int warp_nums = blockDim.x / 32;
     
-    for(int j = warp_id; j < S; j += 8)
-    {
-        float acc = 0.f;
+        // for(int j = warp_id; j < S; j += warp_nums)
+        // {
+        //     float acc = 0.f;
 
-        // lane 分摊 d：lane 0 算 d=0,32；lane 1 算 d=1,32 ...
+        //     // lane 分摊 d：lane 0 算 d=0,32；lane 1 算 d=1,32 ...
+        //     for(int d = lane; d < D; d += 32)
+        //     {
+        //         acc += q_row[d] * __half2float(K[k_base + j * D + d]);
+        //     }
+
+        //     // warp 内进行归约，lane 0 得到完整点积
+        //     for(int offset = 16; offset > 0; offset >>= 1)
+        //     {
+        //         acc += __shfl_down_sync(0xffffffff, acc, offset);
+        //     }
+
+        //     // lane 0 写出结果
+        //     if(lane == 0)
+        //     {
+        //         S_mat[s_base + j] = __float2half(acc * scale);
+        //     }
+        // }
+
+    // 方法三：ILP-4 = 让一个线程同时算 4 个相邻的 S 元素，而不是 1 个。
+    // ILP-4 不是 lane 分组，而是“同一个 lane 同时算 4 个 j”，32 个 lane 仍然全部参与每个 j 的计算和归约。  让lane分组是另一种优化方法
+    // 一次维护 4 个累加器，让 4 条 shuffle 链并行
+    /*
+        在 warp 视角，S 有 1024个j， 8 个warp分摊，1个warp负责128个j，每次处理4个j，一共循环128/4=32次
+
+        在 block 视角，8个warp同时跑，同时一起处理4*8=32个j，1024/32=32，block也要循环32次
+    
+    */
+    for(int j_base = warp_id * 4; j_base < S; j_base += warp_nums * 4)          // warp_id 0-7     warp_nums = 8，
+    {
+        int j0 = j_base, j1 = j_base + 1, j2 = j_base + 2, j3 = j_base + 3;     // 4个j块，连续的 
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;       // 4个累加器，每个线程都有这4个累加器，warp shuffle归约时，就根据累加器来归约的
         for(int d = lane; d < D; d += 32)
         {
-            acc += q_row[d] * __half2float(K[k_base + j * D + d]);
+            float q = q_row[d];
+            a0 += q * __half2float(K[k_base + j0 * D + d]);
+            a1 += q * __half2float(K[k_base + j1 * D + d]);
+            a2 += q * __half2float(K[k_base + j2 * D + d]);
+            a3 += q * __half2float(K[k_base + j3 * D + d]);
         }
 
-        // warp 内进行归约，lane 0 得到完整点积
         for(int offset = 16; offset > 0; offset >>= 1)
         {
-            acc += __shfl_down_sync(0xffffffff, acc, offset);
+            a0 += __shfl_down_sync(0xffffffff, a0, offset);          // 4 组 shuffle 交错，每轮 4 条独立指令
+            a1 += __shfl_down_sync(0xffffffff, a1, offset);
+            a2 += __shfl_down_sync(0xffffffff, a2, offset);
+            a3 += __shfl_down_sync(0xffffffff, a3, offset);
         }
 
-        // lane 0 写出结果
         if(lane == 0)
         {
-            S_mat[s_base + j] = __float2half(acc * scale);
+            S_mat[s_base + j0] = __float2half(a0 * scale); 
+            S_mat[s_base + j1] = __float2half(a1 * scale);
+            S_mat[s_base + j2] = __float2half(a2 * scale);
+            S_mat[s_base + j3] = __float2half(a3 * scale);
         }
     }
+
+
+
+
+
+
+
 
 }
 
@@ -291,14 +341,46 @@ __global__ void pv_kernel(const half* __restrict__ P,
 
     // ---- TODO(你) 5/5：沿 j 累加 ---------------------------------------
     // 外层遍历输出维，内层遍历归约维  [S,S] * [S,D] = [S,D] 
-    for (int d = tid; d < D; d += blockDim.x) 
-    {
-        float acc = 0.f;
-        for (int j = 0; j < S; ++j)
-            acc += __half2float(P[p_base + j]) * __half2float(V[v_base + (size_t)j * D + d]);
-        O[o_base + d] = __float2half(acc);
-    }
+        // for (int d = tid; d < D; d += blockDim.x)                // 外层 d = tid → 只有 tid 0..63 有活干（192 个线程直接跳过循环）
+        // {                                                        // 每个干活的线程串行扫 1024 个 j，每次 1 个 P + 1 个 V 的 load
+        //     float acc = 0.f;
+        //     for (int j = 0; j < S; ++j)
+        //         acc += __half2float(P[p_base + j]) * __half2float(V[v_base + (size_t)j * D + d]);
+        //     O[o_base + d] = __float2half(acc);
+        // }
     // 先别管访存是否合并，跑通再说；跑通后用 ncu 看这个 kernel 的 DRAM 与 L1。
+    // 现在改 P @ V —— 256个线程分4组，j也分4组，每个线程扫 256 个j，少了4倍串行，但还是在一个block里
+    // 切分的就是P矩阵的行、V矩阵的列 ———— j 轴(P的列方向 = V的行方向)，64 个线程一组，切完各自算部分和，最后加起来，每段算的是「部分乘加」
+    // O[d] = partial[0][d] + partial[1][d] + partial[2][d] + partial[3][d]
+    const int group_nums = blockDim.x / D;              // 组数，256/64 = 4
+    const int group_id = threadIdx.x / D;               // 当前组编号，0 1 2 3
+    const int d = threadIdx.x % D;                      // 线程负责的维度，0 1 2 ... 63，共64个维度，256个线程 ———— 4个线程处理一个d
+
+    // 这组负责的 j 区间    
+    const int seg = S / group_nums;                 // 1024/4 = 256     一个区间有256个元素要处理，一个线程固定一个 d，但一个 d 由 4 个线程协作完成
+    const int j0 = group_id * seg;
+    const int j1 = j0 + seg;                        // 每组处理的区间 j0 —— j0 + seg，就是一个 seg，4个seg就覆盖了一个S
+
+    float acc = 0.f;
+    for(int j = j0; j < j1; ++j)
+    {
+        acc += __half2float(P[p_base + j]) * __half2float(V[v_base + j * D + d]);
+    }
+    // 这里一共是4 个组，每组 64 个线程，共256个线程，算了 4 组 × 64 个 d = 256 个部分和，不用在warp里归约，写进共享内存，按线程编号存储；
+    __shared__ float partial[SM_THREADS];       
+    partial[tid] = acc;
+    __syncthreads();
+
+    // 前D个线程负责合并这4段partial，因为1个线程处理1个d，所以只需要D个线程
+    if(threadIdx.x < D)
+    {
+        float sum = 0.f;
+        for(int g = 0; g < group_nums; ++g)
+        {
+            sum += partial[g * D + threadIdx.x];        //  第 g 组算的第 d 列的部分和，前D个线程的id和d列是对应的
+        }
+        O[o_base + threadIdx.x] = __float2half(sum);
+    }
 }
 
 /* ---------------------------------------------------------------------------

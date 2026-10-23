@@ -24,3 +24,11 @@ torch_extensions/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 编辑器/工具产生的备份（不进仓库）
+*.bak-*
+*_基础.py
+*.bak
+
+# 误建的嵌套目录
+kernels/results/
