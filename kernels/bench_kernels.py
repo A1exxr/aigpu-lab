@@ -380,7 +380,7 @@ REGISTRY: list[KernelSpec] = [
         cpp_signature="torch::Tensor gemm_reg(torch::Tensor A, torch::Tensor B);",
         functions=["gemm_reg"],
         note="W6：GEMM 台阶3（寄存器分块 4×4，block 8×8=64 线程；"
-             "每线程算 16 个 C 元素，共享内存读取次数降到 tiled 的 1/16）。"
+             "每线程算 16 个 C 元素，共享内存读取摊薄 4 倍（每读服务 4 次 FMA））。"
              "台阶4 再上 Tensor Core",
         cases=[
             Case(
