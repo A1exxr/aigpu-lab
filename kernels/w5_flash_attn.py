@@ -41,20 +41,21 @@ def _flash_attn_kernel(Q, K, V, O,
         s = tl.where(offs_n[None,:] < S, s, float("-inf"))
 
         # 累加 online softmax版本
-        m_new = tl.maximum  (m_i, tl.max(s,1))                # 新的全局最大值
-        alpha = tl.exp2((m_i - m_new) * 1.44269504)     # 旧尺度 ——> 新尺度
-        p = tl.exp2((s - m_new[:, None]) *  1.44269504)   # 本块权重，用新的m_new
-        l_i = l_i * alpha + tl.sum(p, 1)                # 分母，先缩放再累加
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)   # 分子
-        m_i = m_new     # 最后才更新
+        m_new = tl.maximum  (m_i, tl.max(s,1))                      # 新的全局最大值
+        alpha = tl.exp2((m_i - m_new) * 1.44269504)                 # 旧尺度 ——> 新尺度
+        p = tl.exp2((s - m_new[:, None]) *  1.44269504)             # 当前块权重，用新基准计算当前块权重
+        # 注意，这里l_i 形状是 (Block_m,)，和alpha一样，不用广播
+        l_i = l_i * alpha + tl.sum(p, 1)                            # 更新分母，旧的exp和 换算到新基准，再加上当前块的贡献
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v)    # 更新分子
+        m_i = m_new                                                 # 最后才更新基准
 
 
 
 
-        # 归一化写回
-        o = acc / l_i[:, None]
-        tl.store(O + pid_ph * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od, 
-                 o.to(tl.float16), mask=offs_m[:, None] < S)
+    # 归一化写回，在for循环外面，只需要写一次
+    o = acc / l_i[:, None]
+    tl.store(O + pid_ph * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od, 
+                o.to(tl.float16), mask=offs_m[:, None] < S)
 
 
 

@@ -145,6 +145,11 @@ def _rmsnorm_inputs(shape, dtype, device):
     return {"x": x, "w": w}
 
 
+def ref_gemm(A, B):
+    """w6_gemm.cu 的参考实现：C = A @ B（fp16 输入，fp32 累加后转回 fp16）。"""
+    return torch.matmul(A.float(), B.float()).to(A.dtype)
+
+
 REGISTRY: list[KernelSpec] = [
     KernelSpec(
         name="rmsnorm",
@@ -312,6 +317,87 @@ REGISTRY: list[KernelSpec] = [
                 ),
                 # QKᵀ: 2*S²*D，PV: 2*S²*D，每个 (b,h)
                 flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[2] * s[3],
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="gemm",
+        cuda_file="kernels/w6_gemm.cu",
+        cpp_signature="torch::Tensor gemm(torch::Tensor A, torch::Tensor B);",
+        functions=["gemm"],
+        note="W6：GEMM 台阶1（naive，每线程算 1 个 C 元素，直读全局内存）。"
+             "基线预期 ~19 ms / ~110 GFLOPS；台阶2 加 shared tiling 后应掉到亚毫秒",
+        cases=[
+            Case(
+                label="M=N=K=1024 fp16",
+                shape=(1024, 1024, 1024),
+                dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "A": torch.randn(s[0], s[1], device=dev, dtype=d),
+                    "B": torch.randn(s[1], s[2], device=dev, dtype=d),
+                },
+                cuda_call=lambda mod, inp: mod.gemm(inp["A"], inp["B"]),
+                ref_call=lambda inp: ref_gemm(inp["A"], inp["B"]),
+                # GEMM 是 compute-bound，带宽口径只作"最小流量"参考：
+                # A、B、C 各读/写一次
+                nbytes=lambda s, d: (
+                    (s[0] * s[1] + s[1] * s[2] + s[0] * s[2])
+                    * workloads.elem_bytes(d)
+                ),
+                flops=lambda s, d: 2.0 * s[0] * s[1] * s[2],
+            ),
+        ],
+    ),
+
+        KernelSpec(
+        name="gemm_tiled",
+        cuda_file="kernels/w6_gemm.cu",
+        cpp_signature="torch::Tensor gemm_tiled(torch::Tensor A, torch::Tensor B);",
+        functions=["gemm_tiled"],
+        note="W6：GEMM 台阶2（shared tiling 32×32，每线程算 1 个 C 元素；共享内存 [32][32] 无 padding，曾试 [32][33] 反而慢 41%）。",
+        cases=[
+            Case(
+                label="M=N=K=1024 fp16",
+                shape=(1024, 1024, 1024),
+                dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "A": torch.randn(s[0], s[1], device=dev, dtype=d),
+                    "B": torch.randn(s[1], s[2], device=dev, dtype=d),
+                },
+                cuda_call=lambda mod, inp: mod.gemm_tiled(inp["A"], inp["B"]),
+                ref_call=lambda inp: ref_gemm(inp["A"], inp["B"]),
+                nbytes=lambda s, d: (
+                    (s[0] * s[1] + s[1] * s[2] + s[0] * s[2])
+                    * workloads.elem_bytes(d)
+                ),
+                flops=lambda s, d: 2.0 * s[0] * s[1] * s[2],
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="gemm_reg",
+        cuda_file="kernels/w6_gemm.cu",
+        cpp_signature="torch::Tensor gemm_reg(torch::Tensor A, torch::Tensor B);",
+        functions=["gemm_reg"],
+        note="W6：GEMM 台阶3（寄存器分块 4×4，block 8×8=64 线程；"
+             "每线程算 16 个 C 元素，共享内存读取次数降到 tiled 的 1/16）。"
+             "台阶4 再上 Tensor Core",
+        cases=[
+            Case(
+                label="M=N=K=1024 fp16",
+                shape=(1024, 1024, 1024),
+                dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "A": torch.randn(s[0], s[1], device=dev, dtype=d),
+                    "B": torch.randn(s[1], s[2], device=dev, dtype=d),
+                },
+                cuda_call=lambda mod, inp: mod.gemm_reg(inp["A"], inp["B"]),
+                ref_call=lambda inp: ref_gemm(inp["A"], inp["B"]),
+                nbytes=lambda s, d: (
+                    (s[0] * s[1] + s[1] * s[2] + s[0] * s[2])
+                    * workloads.elem_bytes(d)
+                ),
+                flops=lambda s, d: 2.0 * s[0] * s[1] * s[2],
             ),
         ],
     ),
