@@ -39,8 +39,22 @@ kernels/
   w3_fused_rmsnorm.cu   # 融合：RMSNorm + 残差（+ 量化），对比分步实现
   w4_attn_naive.cu      # 标准 attention：用来证明"它是 memory-bound"（动机）
   w5_flash_attn.py      # FlashAttention 前向（Triton 版上手更快）
+  w6_gemm.cu            # GEMM 三台阶：naive → shared tiling → 4×4 寄存器分块（→ Tensor Core）
   bench_kernels.py      # 复用 gpulab，测你自己的 kernel
 ```
+
+## 现状（2026-10-23）
+
+| kernel | 状态 | 关键数字 |
+|---|---|---|
+| `w2_reduce.cu` | 完成 | 0.1137 ms / 54.3% 带宽，ncu DRAM 87.3%（已贴墙） |
+| `w2_softmax.cu` | 完成 | 0.2160 ms / 57.1%，屏障 20 → 4 |
+| `w2_gelu.cu` | 完成 | 0.1516 ms / **81.4%**，`__half2` 向量化，追平 PyTorch |
+| `w2_rmsnorm.cu` | **跳过** | 知识点已被 w3 融合版覆盖 |
+| `w3_fused_rmsnorm_residual.cu` | 完成 | 融合版 199.9 µs / ncu DRAM 92.8%，比两 kernel 版快 1.95× |
+| `w4_attn_naive.cu` | 完成 | 46.87 → **15.53 ms**（warp-per-j + PV 四路切分 + QK ILP-4） |
+| `w5_flash_attn.py` | 完成 | **0.474 ms**，达 PyTorch SDPA 的 91%，naive 的 1/32.8 |
+| `w6_gemm.cu` | 台阶 1–3 完成 | 2.42 → 1.78 → **0.657 ms**（3.27 TFLOPS），台阶 4（Tensor Core）待做 |
 
 ## 每个 kernel 的验收清单
 
