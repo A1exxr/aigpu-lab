@@ -133,15 +133,29 @@ out    = acc / d
 - **未验证**：`L < BS`（不足一个块，`t/BS` 与 `t%BS` 的边界）——这是欠账，写 README 时不能吹“全长度覆盖”。
 - 收尾块曾经有 4 个 bug（`t/BS`、`t%BS`、`d += 32`、`acc[k]`），在 `kernels/CUDA错题本.md` 的 E-73/E-74 有记录。
 
-## 7. 下一步：INT8 KV cache
+## 7. 台阶 5：INT8 KV cache（已实测）
 
-| 方案 | 流量 | 下限 | 预期 |
-|---|---|---|---|
-| fp16（现在） | 256 MiB | 1.21 ms | 1.2483 ms |
-| **INT8 KV** | **128 MiB** | **0.58 ms** | 0.65~0.70 ms |
+| 版本 | 流量 | ms | 实测带宽 | 占 221.4 天花板 |
+|---|---|---|---|---|
+| fp16 单链 2 路 | 256.0 MiB | 1.5084 | 178.1 GB/s | 80.4% |
+| fp16 split-L | 256.0 MiB | 1.2483 | 215.1 GB/s | 97.2% |
+| **INT8 K（台阶1）** | **193.1 MiB** | **1.1377** | **178.0 GB/s** | 80.4% |
 
-做法：`k_cache`/`v_cache` 存 int8 + 每组一个 fp16 scale（per-token 或 per-head），kernel 里反量化后再点积。
-风险：量化误差会直接进 attention 分数，需要用 `max_abs + 与 fp16 的最大相对误差` 两种口径验收，不能只看 `allclose`。
+口径：bench 打印的百分比用标称 272 GB/s，本表「占 221.4」用实测天花板，两个数不要混用。
+
+做法（只动 K，V/Q/out 仍是 fp16）：
+
+- `k_q` = int8 `[NB,BS,H,D]`（128 → 64 MiB），`k_scale` = fp16 `[NB,BS,H]`（0.75 MiB），per-(token, head) 对称量化，`scale = max|x| / 127`。
+- 反量化分两次：元素级 `(float)krow[d]`，以及归约后的 `s *= sc`（等价于把 scale 提到求和号外，每 token 只乘 1 次；放进内层就变成每元素乘 1 次，白吃 128 条乘法指令）。
+- 误差：`max_abs = 9.77e-4`（参考值量级 0.64）、`max_rel = 9.5e-3`，远小于 1e-2 容差。per-token scale 让每个 token 都吃满 8 位动态范围，误差主要来自 `round()` 取整。
+
+读数：流量 −24.6%，时间 −8.9%（相对 fp16 单链 2 路），带宽利用率 80.4% 不变 —— **INT8 的收益是「字节数线性兑现」**：在 D=128、每 lane 4 次 1 字节加载的模式下扇区利用率仍是 100%，没有付额外指令代价。（第一次跑出 1.3517 ms / 67.7% 是冷启动噪声，不作为结论。）
+
+下一步（按收益排序）：
+
+1. **V 也量化**：流量 193.1 → 137.6 MiB，同利用率下 ≈ 0.81 ms。V 的 scale 可以并进 `p`（`pc = p * sc_v`），每元素不增加指令。
+2. **int8×4 向量化加载**：每 lane 读 4 字节，L1 事务数降到 1/4，目标把利用率从 80% 推到 90%+。
+3. **dp4a**：Q 也量化成 int8，一条指令做 4 次乘加——此时才真正用上整数算力。
 
 ## 8. 文件
 
@@ -151,10 +165,13 @@ out    = acc / d
 | `kernels/w7_paged_attn.cu` | 单链 2 路展开（1.5084 ms） |
 | `kernels/w7_paged_attn_单遍online.cu.bak` | 单遍 online（1.8897 ms） |
 | `kernels/w7_paged_attn_参考版.cu.bak` | 参考实现（1.9763 ms） |
-| `kernels/bench_kernels.py` | REGISTRY 里 `paged_attn` / `paged_attn_split` 两条 |
+| `kernels/w8_int8_attn.cu` | INT8 K（台阶1，1.1377 ms） |
+| `kernels/w8_INT8台阶1-实现契约.md` | 台阶1 的契约与 19 处改动清单 |
+| `kernels/bench_kernels.py` | REGISTRY 里 `paged_attn` / `paged_attn_split` / `paged_attn_int8` 三条 |
 
 ## 9. 面试能讲的三点
 
 1. **为什么 decode 是带宽题**：AI=32 vs 拐点 240，算力闲着，瓶颈是 256 MiB 的 KV 读。
 2. **为什么 2 路展开有用而 4 路没继续**：ILP 补的是“单 warp 内请求数”，split-L 补的是“warp 总数”；前者天花板是寄存器，后者天花板是 SM 数量。到 97% 实测带宽后两者都没意义了。
 3. **split-L 的坑在归一化时机**：每段用各自的 `m_i` 算出的 `d_i` 和 `acc_i` 是不同基准的，必须在 merge 时用 `exp(m_i - M)` 校正；提前归一化就无法还原。
+4. **INT8 省的是搬运不是算力**：decode 阶段算力闲置，int8 的全部价值是把 K 的 128 MiB 砍到 64 MiB；实现上仍是「读 int8 → 转 float → fp32 累加」，真正的整数算力要等 dp4a。scale 必须乘在归约之后（`Σ q·(sc·k) = sc·Σ q·k`），否则每元素多一条乘法。

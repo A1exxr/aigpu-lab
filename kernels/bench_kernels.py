@@ -183,6 +183,32 @@ def _make_paged_inputs(shape, dtype, dev):
             "block_table": block_table, "context_lens": context_lens}
 
 
+def _make_paged_int8_inputs(shape, dtype, dev):
+    """K cache 为 int8 + per-(token,head) 对称量化 scale；V 仍是 fp16。"""
+    B, H, ctx, D = shape
+    bs = 16
+    maxb = (ctx + bs - 1) // bs
+    nb = B * maxb
+    q = torch.randn(B, H, D, device=dev, dtype=dtype)
+    k = torch.randn(nb, bs, H, D, device=dev, dtype=torch.float32)
+    absmax = k.abs().amax(dim=-1, keepdim=True).clamp_min(1e-5)
+    scale = (absmax / 127.0).to(torch.float16)                 # [nb,bs,H,1]
+    k_q = torch.round(k / scale.float()).clamp(-127, 127).to(torch.int8)
+    v_cache = torch.randn(nb, bs, H, D, device=dev, dtype=dtype)
+    perm = torch.randperm(nb, device=dev)
+    block_table = perm[: B * maxb].reshape(B, maxb).to(torch.int32).contiguous()
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=dev)
+    return {"q": q, "k_q": k_q, "k_scale": scale.squeeze(-1).contiguous(),
+            "v_cache": v_cache, "block_table": block_table,
+            "context_lens": context_lens}
+
+
+def ref_paged_attn_int8(q, k_q, k_scale, v_cache, block_table, context_lens):
+    """先把 int8 K 反量化回 fp32，再走 fp16 的参考实现。"""
+    k_cache = k_q.float() * k_scale.float().unsqueeze(-1)
+    return ref_paged_attn(q, k_cache, v_cache, block_table, context_lens)
+
+
 REGISTRY: list[KernelSpec] = [
     KernelSpec(
         name="rmsnorm",
@@ -548,6 +574,41 @@ REGISTRY: list[KernelSpec] = [
                 nbytes=lambda s, d: (
                     (2 * s[0] * s[1] * s[3] + 2 * s[0] * s[1] * s[2] * s[3])
                     * workloads.elem_bytes(d)
+                ),
+                flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[3],
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="paged_attn_int8",
+        cuda_file="kernels/w8_int8_attn.cu",
+        cpp_signature=(
+            "torch::Tensor paged_attn_int8("
+            "torch::Tensor q, torch::Tensor k_q, torch::Tensor k_scale, "
+            "torch::Tensor v_cache, torch::Tensor block_table, "
+            "torch::Tensor context_lens);"
+        ),
+        functions=["paged_attn_int8"],
+        note="W8：PagedAttention + INT8 KV cache（台阶1：K 存 int8、读出来反量化）。"
+             "K 流量 128->64 MiB，总流量 256->193 MiB",
+        cases=[
+            Case(
+                label="(8,32,2048,128) fp16q/int8k",
+                shape=(8, 32, 2048, 128),
+                dtype="fp16",
+                make_inputs=_make_paged_int8_inputs,
+                cuda_call=lambda mod, inp: mod.paged_attn_int8(
+                    inp["q"], inp["k_q"], inp["k_scale"], inp["v_cache"],
+                    inp["block_table"], inp["context_lens"]),
+                ref_call=lambda inp: ref_paged_attn_int8(
+                    inp["q"], inp["k_q"], inp["k_scale"], inp["v_cache"],
+                    inp["block_table"], inp["context_lens"]),
+                # q/out 2*B*H*D*2B + K B*H*ctx*D*1B + scale B*H*ctx*2B + V B*H*ctx*D*2B
+                nbytes=lambda s, d: (
+                    2 * s[0] * s[1] * s[3] * 2
+                    + s[0] * s[1] * s[2] * s[3] * 1
+                    + s[0] * s[1] * s[2] * 2
+                    + s[0] * s[1] * s[2] * s[3] * 2
                 ),
                 flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[3],
             ),
