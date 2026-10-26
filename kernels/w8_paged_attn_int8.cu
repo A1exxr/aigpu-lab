@@ -2,7 +2,7 @@
 // 基于 w7_paged_attn.cu（单链 2 路展开版），只换 K 的存储格式，算法不变。
 //
 // 核心：score(t,h) = scale(t,h) * Σ_d q[d] * k8[t,d]
-//       scale 对 d 是常数 → 提到 warp 归约之后乘一次，而不是每元素乘一次。
+//      每个token的每个头都有一个scale，一共有 2048 * 32 =65536个scale，  一个头有128维，共同用一个scale
 
 #include <torch/extension.h>
 #include <cuda_fp16.h>
@@ -12,7 +12,7 @@
 #define DMAX 128    // 每个头的最大维度（DMAX/32 = 每线程最多 4 个元素）
 
 __global__ void paged_attn_int8_kernel(const half*   __restrict__ q,            // [B,H,D]
-                                       const int8_t* __restrict__ k_q,          // [NB,BS,H,D] 量化后的 K
+                                       const int8_t* __restrict__ k_q,          // [NB,BS,H,D] 量化后的 K 是int8类型
                                        const half*   __restrict__ k_scale,      // [NB,BS,H]   每个 (token,head) 一个 scale
                                        const half*   __restrict__ v_cache,      // [NB,BS,H,D] V 未量化
                                        const int*    __restrict__ block_table,  // [B,MAXB]
@@ -43,8 +43,8 @@ __global__ void paged_attn_int8_kernel(const half*   __restrict__ q,            
         int off0  = t % BS;
         size_t row0 = ((size_t)(phys0 * BS + off0) * H + h) * D;
         const int8_t* krow0 = k_q + row0;
-        const half*   vrow0 = v_cache + row0;
-        size_t sidx0 = (size_t)(phys0 * BS + off0) * H + h;
+        const half*   vrow0 = v_cache + row0; 
+        size_t sidx0 = (size_t)(phys0 * BS + off0) * H + h;         // 计算该token的这个头的scale在k_scale的位置    [NB,BS,H]
         float  sc0   = __half2float(k_scale[sidx0]);
 
         // ---- token t+1 ----

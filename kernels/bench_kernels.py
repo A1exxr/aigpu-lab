@@ -203,6 +203,39 @@ def _make_paged_int8_inputs(shape, dtype, dev):
             "context_lens": context_lens}
 
 
+def _make_paged_int8kv_inputs(shape, dtype, dev):
+    """K 和 V 都是 int8 + per-(token,head) 对称 scale；q/out 仍是 fp16。"""
+    B, H, ctx, D = shape
+    bs = 16
+    maxb = (ctx + bs - 1) // bs
+    nb = B * maxb
+    q = torch.randn(B, H, D, device=dev, dtype=dtype)
+
+    def _quant(x):
+        absmax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-5)
+        scale = (absmax / 127.0).to(torch.float16)
+        q8 = torch.round(x / scale.float()).clamp(-127, 127).to(torch.int8)
+        return q8, scale.squeeze(-1).contiguous()
+
+    k = torch.randn(nb, bs, H, D, device=dev, dtype=torch.float32)
+    v = torch.randn(nb, bs, H, D, device=dev, dtype=torch.float32)
+    k_q, k_scale = _quant(k)
+    v_q, v_scale = _quant(v)
+
+    perm = torch.randperm(nb, device=dev)
+    block_table = perm[: B * maxb].reshape(B, maxb).to(torch.int32).contiguous()
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=dev)
+    return {"q": q, "k_q": k_q, "k_scale": k_scale, "v_q": v_q, "v_scale": v_scale,
+            "block_table": block_table, "context_lens": context_lens}
+
+
+def ref_paged_attn_int8kv(q, k_q, k_scale, v_q, v_scale, block_table, context_lens):
+    """K/V 都先反量化回 fp32，再走 fp16 参考实现。"""
+    k_cache = k_q.float() * k_scale.float().unsqueeze(-1)
+    v_cache = v_q.float() * v_scale.float().unsqueeze(-1)
+    return ref_paged_attn(q, k_cache, v_cache, block_table, context_lens)
+
+
 def ref_paged_attn_int8(q, k_q, k_scale, v_cache, block_table, context_lens):
     """先把 int8 K 反量化回 fp32，再走 fp16 的参考实现。"""
     k_cache = k_q.float() * k_scale.float().unsqueeze(-1)
@@ -581,7 +614,7 @@ REGISTRY: list[KernelSpec] = [
     ),
     KernelSpec(
         name="paged_attn_int8",
-        cuda_file="kernels/w8_int8_attn.cu",
+        cuda_file="kernels/w8_paged_attn_int8.cu",
         cpp_signature=(
             "torch::Tensor paged_attn_int8("
             "torch::Tensor q, torch::Tensor k_q, torch::Tensor k_scale, "
@@ -609,6 +642,39 @@ REGISTRY: list[KernelSpec] = [
                     + s[0] * s[1] * s[2] * s[3] * 1
                     + s[0] * s[1] * s[2] * 2
                     + s[0] * s[1] * s[2] * s[3] * 2
+                ),
+                flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[3],
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="paged_attn_int8kv",
+        cuda_file="kernels/w8_paged_attn_int8kv.cu",
+        cpp_signature=(
+            "torch::Tensor paged_attn_int8kv("
+            "torch::Tensor q, torch::Tensor k_q, torch::Tensor k_scale, "
+            "torch::Tensor v_q, torch::Tensor v_scale, "
+            "torch::Tensor block_table, torch::Tensor context_lens);"
+        ),
+        functions=["paged_attn_int8kv"],
+        note="W8 台阶2：K/V 都 int8（V 的 scale 折进 p）。流量 256 -> 137.6 MiB",
+        cases=[
+            Case(
+                label="(8,32,2048,128) int8k+int8v",
+                shape=(8, 32, 2048, 128),
+                dtype="fp16",
+                make_inputs=_make_paged_int8kv_inputs,
+                cuda_call=lambda mod, inp: mod.paged_attn_int8kv(
+                    inp["q"], inp["k_q"], inp["k_scale"], inp["v_q"], inp["v_scale"],
+                    inp["block_table"], inp["context_lens"]),
+                ref_call=lambda inp: ref_paged_attn_int8kv(
+                    inp["q"], inp["k_q"], inp["k_scale"], inp["v_q"], inp["v_scale"],
+                    inp["block_table"], inp["context_lens"]),
+                # q/out 2*B*H*D*2B + K,V 各 B*H*ctx*D*1B + 两个 scale 各 B*H*ctx*2B
+                nbytes=lambda s, d: (
+                    2 * s[0] * s[1] * s[3] * 2
+                    + 2 * s[0] * s[1] * s[2] * s[3] * 1
+                    + 2 * s[0] * s[1] * s[2] * 2
                 ),
                 flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[3],
             ),
