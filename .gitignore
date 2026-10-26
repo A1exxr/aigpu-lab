@@ -25,9 +25,14 @@ torch_extensions/
 .DS_Store
 Thumbs.db
 
-# 备份与误建目录（不进仓库）
-*.bak-*
+# 本地备份 / 草稿（不入库）
 *.bak
-*_基础.py
-kernels/results/
+*.bak-*
+*.bak2
 
+# 运行残留
+kernels/results/
+kernels/111.cu
+
+# 笔记原文：体积大、且只有自测清单有展示价值
+notes/cuda-guide-读书笔记.txt

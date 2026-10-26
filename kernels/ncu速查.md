@@ -528,3 +528,73 @@ qk 的例子：每个 block 读 128 KB 的 `K[b,h]`，共 32768 个 block → 4 
 7. 浪费率按 **sector（32 B）**算，不是 line（128 B）；合并好坏看 sectors/request 是否等于每线程字节数。
 8. **一次多算几个（ILP）** 是用独立链填 shuffle/访存的延迟洞；发射效率 = 理论时间 ÷ 实测时间。
 9. 寄存器每线程 ≤42 才可能 100% occupancy；`mio_throttle` = 片上队列满，`short_scoreboard` = 等片上，`long_scoreboard` = 等显存。
+
+---
+
+## 13. 指令名速查（看见 `ld.global` / `ld.shared` / `ldmatrix` 不认识就翻这里）
+
+### 13.1 先搞清楚：C++ 代码最后变成"指令"
+
+你写的每一行 C++，编译后都会变成一串**机器指令**。其中"搬运数据"的那一类，全叫 **load / store**。
+名字长这样：`ld.global.u16` —— 读作"**load · 全局空间 · 16 位**"。
+
+| 你在 CUDA 里写的 | 编译出来的指令（PTX 名） | SASS 里显示为 | 从哪搬到哪 | 延迟 |
+|---|---|---|---|---|
+| `x[i]`（`x` 是 kernel 形参，指向显存） | `ld.global.u16` | `LDG.E.U16` | **显存 → 寄存器** | **约 400–800 个周期** |
+| `As[r][c]`（`As` 是 `__shared__`） | `ld.shared.u16` | `LDS.U16` | **共享内存 → 寄存器** | **约 20–40 个周期** |
+| `As[r][c] = v` | `st.shared.u16` | `STS.U16` | 寄存器 → 共享内存 | 快 |
+| `Out[i] = v` | `st.global.u16` | `STG.E.U16` | 寄存器 → 显存 | 慢（但不用等） |
+| 浮点乘加 `acc += a*b` | `fma.rn.f32` | `FFMA` | 纯计算 | 几个周期 |
+| `__syncthreads()` | `bar.sync` | `BAR.SYNC` | 屏障 | — |
+| `__shfl_down_sync(...)` | `shfl.sync.down.b32` | `SHFL` | warp 内寄存器互换 | 几周期 |
+
+> **一句话**：`ld.global` 和 `ld.shared` 都是"读"，区别只在**从哪个空间读**。
+> 全局空间（global）就是显存；共享空间（shared）就是 `__shared__` 那块片上内存。
+> **延迟差 20 倍以上**，这就是"把数据搬进共享内存再用"的全部理由。
+
+### 13.2 `ldmatrix`（台阶 4 才会用到）
+
+`ldmatrix.sync.aligned.m8n8.x4.shared.b16` —— Tensor Core 专用的"批量装载"指令：
+
+- 普通 `ld.shared`：**每个线程自己读自己要的那几个数**，一次一条；
+- `ldmatrix`：**一条指令、整个 warp 协作**，一次把 **4 个 8×8 的小块**搬进寄存器，
+  而且**自动摆成 mma 需要的 lane 布局**（哪个数落哪个 lane，由硬件定死）。
+
+**类比**：`ld.shared` 是"一件一件从货架上拿"；`ldmatrix` 是"整托盘推过来，还按流水线的顺序摆好了"。
+
+为什么需要它：Tensor Core 的 `mma` 要求 A/B 的每个元素**必须**在指定的 lane 里。
+靠 `ld.shared` + 手动重排也能做到，但要多花一堆 `shfl`/`mov`，所以硬件专门给了这条指令。
+
+### 13.3 另外三个高频名字
+
+| 名字 | 是什么 | 什么时候出现 |
+|---|---|---|
+| `FFMA` | 一条乘加（1 个乘 + 1 个加） | 你台阶 3 里 `acc[i][j] += a[i]*b[j]`，每执行一次就是一条 FFMA |
+| `mma.sync` / `HMMA` | **warp 级**矩阵乘加，一条 = 4096 次 FMA（16×16×16） | 台阶 4，`wmma::mma_sync` |
+| `cp.async` | 异步拷贝（显存 → 共享内存，**不经过寄存器**） | 流水线 / 双缓冲，`num_stages` 在底层用它 |
+
+### 13.4 想看自己的 kernel 到底生成了什么指令
+
+```bash
+# 看 SASS：每行 C++ 编译成了哪些指令
+cuobjdump -sass <你的.cubin 或 .o>
+
+# 或者让 nvcc 直接留下中间文件
+nvcc -arch=sm_89 -ptx w6_gemm.cu -o w6.ptx      # 看 PTX（ld.global 这一层）
+nvcc -arch=sm_89 -cubin w6_gemm.cu -o w6.cubin   # 再 cuobjdump -sass 看 SASS
+```
+
+ncu 的 **Source 页**也能看到"这一行 C++ 编译成了几条 SASS、每条执行了多少次"，
+比读汇编快得多——这是查"为什么慢"的最后一招。
+
+### 13.5 为什么"被 L2 接住"的重复读不构成带宽压力
+
+- `ld.global` 发出去后，硬件先查 **L1（片上，几十 KB）**，没命中查 **L2（片上，几 MB）**，还没命中才去 **DRAM**。
+- 同一个 `A[i][kk]` 被不同 block 反复读：第一次落到 DRAM，后面都命中 L2。
+- 所以 **"访问次数"和"DRAM 搬运字节"是两回事**：
+  - naive GEMM 的 `2MNK = 2.1×10⁹` 次 `ld.global`，DRAM 实际只搬 A/B/C 一共 **6 MB 级**；
+  - 慢的原因是**请求太多**：每条 `ld.global` 都要排进队列等 400+ 周期，SM 同时在飞的请求数有限，
+    于是卡在"发不动"而不是"车道满了"。
+- 判断口径：
+  - `dram__throughput.avg.pct_of_peak_sustained_elapsed` 高（>85%）→ 真带宽瓶颈；
+  - 这个数低但 kernel 慢 → 查 `long_scoreboard`（等显存回来）和 `Mem Busy`（请求排队）。
