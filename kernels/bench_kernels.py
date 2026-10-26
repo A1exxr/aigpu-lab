@@ -150,6 +150,39 @@ def ref_gemm(A, B):
     return torch.matmul(A.float(), B.float()).to(A.dtype)
 
 
+def ref_paged_attn(q, k_cache, v_cache, block_table, context_lens):
+    """PagedAttention decode 的参考实现（fp32 计算；先把逻辑块 gather 成连续 K/V 再算）。"""
+    B, H, D = q.shape
+    bs = k_cache.size(1)
+    out = torch.zeros(B, H, D, dtype=torch.float32, device=q.device)
+    for b in range(B):
+        L = int(context_lens[b].item())
+        nb = (L + bs - 1) // bs
+        phys = block_table[b, :nb]                      # [nb] 物理块号（乱序）
+        k = k_cache[phys].reshape(-1, H, D)[:L].float()
+        v = v_cache[phys].reshape(-1, H, D)[:L].float()
+        scores = torch.einsum("hd,lhd->hl", q[b].float(), k)
+        probs = torch.softmax(scores, dim=-1)
+        out[b] = torch.einsum("hl,lhd->hd", probs, v)
+    return out.to(q.dtype)
+
+
+def _make_paged_inputs(shape, dtype, dev):
+    """shape = (B, H, ctx, D)；块表用随机置换，杜绝"物理块恰好连续"的巧合。"""
+    B, H, ctx, D = shape
+    bs = 16
+    maxb = (ctx + bs - 1) // bs
+    nb = B * maxb
+    q = torch.randn(B, H, D, device=dev, dtype=dtype)
+    k_cache = torch.randn(nb, bs, H, D, device=dev, dtype=dtype)
+    v_cache = torch.randn(nb, bs, H, D, device=dev, dtype=dtype)
+    perm = torch.randperm(nb, device=dev)
+    block_table = perm[: B * maxb].reshape(B, maxb).to(torch.int32).contiguous()
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=dev)
+    return {"q": q, "k_cache": k_cache, "v_cache": v_cache,
+            "block_table": block_table, "context_lens": context_lens}
+
+
 REGISTRY: list[KernelSpec] = [
     KernelSpec(
         name="rmsnorm",
@@ -398,6 +431,125 @@ REGISTRY: list[KernelSpec] = [
                     * workloads.elem_bytes(d)
                 ),
                 flops=lambda s, d: 2.0 * s[0] * s[1] * s[2],
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="gemm_tc",
+        cuda_file="kernels/w6_gemm.cu",
+        cpp_signature="torch::Tensor gemm_tc(torch::Tensor A, torch::Tensor B);",
+        functions=["gemm_tc"],
+        note="W6：GEMM 台阶4（Tensor Core / wmma 16×16×16，block 32×4=128 线程=4 warp，"
+             "每个 warp 算 C tile 的一个 16×16 子块；fp32 累加后转 fp16 写回）。"
+             "参考实现仍是 PyTorch fp32 matmul，所以台阶4 可以直接越过基线",
+        cases=[
+            Case(
+                label="M=N=K=1024 fp16",
+                shape=(1024, 1024, 1024),
+                dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "A": torch.randn(s[0], s[1], device=dev, dtype=d),
+                    "B": torch.randn(s[1], s[2], device=dev, dtype=d),
+                },
+                cuda_call=lambda mod, inp: mod.gemm_tc(inp["A"], inp["B"]),
+                ref_call=lambda inp: ref_gemm(inp["A"], inp["B"]),
+                nbytes=lambda s, d: (
+                    (s[0] * s[1] + s[1] * s[2] + s[0] * s[2])
+                    * workloads.elem_bytes(d)
+                ),
+                flops=lambda s, d: 2.0 * s[0] * s[1] * s[2],
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="gemm_tc2",
+        cuda_file="kernels/w6_gemm.cu",
+        cpp_signature="torch::Tensor gemm_tc2(torch::Tensor A, torch::Tensor B);",
+        functions=["gemm_tc2"],
+        note="W6：GEMM 台阶4b（Tensor Core + 64×64 tile，block 32×16=512 线程=16 warp，"
+             "每 warp 一个 16×16 子块；As[64][32] / Bs[32][64] / Cf[64][64]，共享内存 24 KB）。"
+             "相对台阶4 的 32×32 tile：warp 数 4→16，每 SM 驻留 3 个 block",
+        cases=[
+            Case(
+                label="M=N=K=1024 fp16",
+                shape=(1024, 1024, 1024),
+                dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "A": torch.randn(s[0], s[1], device=dev, dtype=d),
+                    "B": torch.randn(s[1], s[2], device=dev, dtype=d),
+                },
+                cuda_call=lambda mod, inp: mod.gemm_tc2(inp["A"], inp["B"]),
+                ref_call=lambda inp: ref_gemm(inp["A"], inp["B"]),
+                nbytes=lambda s, d: (
+                    (s[0] * s[1] + s[1] * s[2] + s[0] * s[2])
+                    * workloads.elem_bytes(d)
+                ),
+                flops=lambda s, d: 2.0 * s[0] * s[1] * s[2],
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="paged_attn",
+        cuda_file="kernels/w7_paged_attn.cu",
+        cpp_signature=(
+            "torch::Tensor paged_attn("
+            "torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, "
+            "torch::Tensor block_table, torch::Tensor context_lens);"
+        ),
+        functions=["paged_attn"],
+        note="W7：PagedAttention decode（KV cache 分块 + 块表间接寻址，块表乱序）。"
+             "算术强度 ≈1 -> 纯 memory-bound，decode 的典型特征",
+        cases=[
+            Case(
+                label="(8,32,2048,128) fp16",
+                shape=(8, 32, 2048, 128),
+                dtype="fp16",
+                make_inputs=_make_paged_inputs,
+                cuda_call=lambda mod, inp: mod.paged_attn(
+                    inp["q"], inp["k_cache"], inp["v_cache"],
+                    inp["block_table"], inp["context_lens"]),
+                ref_call=lambda inp: ref_paged_attn(
+                    inp["q"], inp["k_cache"], inp["v_cache"],
+                    inp["block_table"], inp["context_lens"]),
+                # 流量：q + out（各 B*H*D）+ K/V 各 B*H*ctx*D（每个 (b,h) 都完整读一遍）
+                nbytes=lambda s, d: (
+                    (2 * s[0] * s[1] * s[3] + 2 * s[0] * s[1] * s[2] * s[3])
+                    * workloads.elem_bytes(d)
+                ),
+                # QK: 2*B*H*ctx*D，PV: 2*B*H*ctx*D
+                flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[3],
+            ),
+        ],
+    ),
+
+    KernelSpec(
+        name="paged_attn_split",
+        cuda_file="kernels/w7_paged_attn_split.cu",
+        cpp_signature=(
+            "torch::Tensor paged_attn_split("
+            "torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, "
+            "torch::Tensor block_table, torch::Tensor context_lens);"
+        ),
+        functions=["paged_attn_split"],
+        note="W7b：split-L 版（把 L 切 4 段并行，再用 merge kernel 按 online softmax 合并）。"
+             "工作单元 B*H*4=1024，目标是吃满带宽",
+        cases=[
+            Case(
+                label="(8,32,2048,128) fp16",
+                shape=(8, 32, 2048, 128),
+                dtype="fp16",
+                make_inputs=_make_paged_inputs,
+                cuda_call=lambda mod, inp: mod.paged_attn_split(
+                    inp["q"], inp["k_cache"], inp["v_cache"],
+                    inp["block_table"], inp["context_lens"]),
+                ref_call=lambda inp: ref_paged_attn(
+                    inp["q"], inp["k_cache"], inp["v_cache"],
+                    inp["block_table"], inp["context_lens"]),
+                nbytes=lambda s, d: (
+                    (2 * s[0] * s[1] * s[3] + 2 * s[0] * s[1] * s[2] * s[3])
+                    * workloads.elem_bytes(d)
+                ),
+                flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[3],
             ),
         ],
     ),
