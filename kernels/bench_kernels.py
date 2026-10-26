@@ -680,6 +680,39 @@ REGISTRY: list[KernelSpec] = [
             ),
         ],
     ),
+    KernelSpec(
+        name="paged_attn_int8kv_vec4",
+        cuda_file="kernels/w8_paged_attn_int8kv_vec4.cu",
+        cpp_signature=(
+            "torch::Tensor paged_attn_int8kv("
+            "torch::Tensor q, torch::Tensor k_q, torch::Tensor k_scale, "
+            "torch::Tensor v_q, torch::Tensor v_scale, "
+            "torch::Tensor block_table, torch::Tensor context_lens);"
+        ),
+        functions=["paged_attn_int8kv"],
+        note="W8 台阶3：int8x4 向量化（K/V 都 int8，每 lane 一次读 4 字节）。流量同台阶2 = 130.1 MiB",
+        cases=[
+            Case(
+                label="(8,32,2048,128) int8kv vec4",
+                shape=(8, 32, 2048, 128),
+                dtype="fp16",
+                make_inputs=_make_paged_int8kv_inputs,
+                cuda_call=lambda mod, inp: mod.paged_attn_int8kv(
+                    inp["q"], inp["k_q"], inp["k_scale"], inp["v_q"], inp["v_scale"],
+                    inp["block_table"], inp["context_lens"]),
+                ref_call=lambda inp: ref_paged_attn_int8kv(
+                    inp["q"], inp["k_q"], inp["k_scale"], inp["v_q"], inp["v_scale"],
+                    inp["block_table"], inp["context_lens"]),
+                nbytes=lambda s, d: (
+                    2 * s[0] * s[1] * s[3] * 2
+                    + 2 * s[0] * s[1] * s[2] * s[3] * 1
+                    + 2 * s[0] * s[1] * s[2] * 2
+                ),
+                flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[3],
+            ),
+        ],
+    ),
+
 ]
 
 
