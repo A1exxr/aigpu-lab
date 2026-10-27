@@ -46,7 +46,7 @@ python kernels/bench_kernels.py --only gelu --verbose-build
 | Attention naive（3 kernel） | `kernels/w4_attn_naive.cu` | **15.53 ms**（首版 46.87） | 4.41 ms | 18.4 GB/s（6.8%） | 卡在 L1 扇区 + 指令发射，未到 DRAM（残余瓶颈需 tiling） |
 | FlashAttention（Triton） | `kernels/w5_flash_attn.py` | **0.474 ms** | 0.432 ms（SDPA） | 不适用，见下 | **18.1 TFLOPS（27.8% fp16 峰值）** → 比 naive 快 **32.8×**，达 SDPA 的 **91%** |
 | GEMM（四级台阶） | `kernels/w6_gemm.cu` | **0.2836 ms**（naive 2.42 → tiled 1.78 → 寄存器分块 0.66 → Tensor Core 0.28） | 0.3256 ms（fp32 matmul） | 不适用（compute-bound） | **7.57 TFLOPS（fp16 峰值 11.6%）→ 1.13× PyTorch fp32 matmul**；4b 放大到 64×64 tile 反而退到 0.383 ms |
-| PagedAttention decode | `kernels/w7_paged_attn_split.cu` | **1.2483 ms**（naive 2.36 → 单遍 1.89 → 2 路展开 1.51 → split-L 1.25） | 8.362 ms（显式循环 ref） | 215.1 GB/s（79.1% 标称 / **97.2% 实测量**） | memory-bound，已贴实测墙 |
+| PagedAttention decode | `kernels/w8_paged_attn_int8.cu` | **1.0419 ms**（naive 2.36 → 单遍 1.89 → 2 路 1.51 → split-L 1.25 → **K 量化 1.04**） | 8.362 ms（显式循环 ref） | 194.4 GB/s（71.5% 标称 / **87.8% 实测量**） | memory-bound；INT8 只量化 K 才划算，V 也量化反而掉回 1.20 ms |
 
 > **口径说明**：`有效带宽 = 算法流量 ÷ 时间`，分母用 272 GB/s（标称）。
 > 实测天花板是 **221 GB/s**（平凡 `scale` kernel 打出来的数）。
@@ -180,7 +180,7 @@ M=N=K=1024、fp16；参考实现是 PyTorch 的 **fp32** matmul（0.3256 ms / 6.
 结论不是"tile 越大越好"，而是 **tile 大小必须和每 SM 的驻留能力一起算**；真正的大 tile（128×128）要配 8 warp 和双缓冲流水（`cp.async`），
 那是 cuBLAS 量级的工程，已超出本项目范围。
 
-### PagedAttention decode：2.36 ms → 1.25 ms（1.89×，达实测带宽 97.2%）
+### PagedAttention decode：2.36 ms → 1.04 ms（2.26×，INT8 只量化 K 才划算）
 
 decode 每步只有 1 个 query token，却要读完 2048 个历史 token 的 KV cache（**256 MiB**）。
 KV 按 16 token 一块散落在 1024 个物理块里，靠 `block_table` 映射——这是纯带宽题：
@@ -195,7 +195,8 @@ KV 按 16 token 一块散落在 1024 个物理块里，靠 `block_table` 映射�
 | 1 naive | 两遍扫描：先求 max/分母，再算加权和 | 384 MiB | 2.3644 ms | 170.3 GB/s | 76.9% |
 | 2 online softmax | `m/denom/acc` 增量更新，KV 只读一遍 | 256 MiB | 1.8897 ms | 142.1 GB/s | 64.2% |
 | 3 单链 2 路展开 | 一次吃 2 个 token，4 个独立 load 交错 | 256 MiB | 1.5084 ms | 178.1 GB/s | 80.4% |
-| 4 **split-L** | L 切 4 段并行 + merge kernel | 256 MiB | **1.2483 ms** | **215.1 GB/s** | **97.2%** |
+| 4 split-L | L 切 4 段并行 + merge kernel | 256 MiB | 1.2483 ms | 215.1 GB/s | **97.2%** |
+| 5 **K 换 int8** | 只把 KV cache 里的 K 换成 int8（V/Q/out 仍 fp16），scale 提到点积累加之后 | 193 MiB | **1.0419 ms** | **194.4 GB/s** | **87.8%** |
 
 三步各自解决不同瓶颈，数据可以互相印证：
 
@@ -203,8 +204,18 @@ KV 按 16 token 一块散落在 1024 个物理块里，靠 `block_table` 映射�
 - **单遍 → 2 路展开**：单遍时每迭代只有 2 个 load 在飞，延迟藏不住；展开到 4 个后 1.25×。
 - **→ split-L**：ILP 已到寄存器上限，但 warp 总数只有 32 个 block，SM 吃不饱；切段后 grid = 128，1.21×。
 
-**为什么停**：`215.1 ÷ 221.4 = 97.2%`，只剩 2.5%。bench 报 79.1% 是拿 272 标称做分母，
-而这张卡从未到过 272。要更快只能**少搬字节** → 下一步 INT8 KV（256 → 128 MiB，下限 0.58 ms）。
+**fp16 路线的终点**：`215.1 ÷ 221.4 = 97.2%`，只剩 2.5%。bench 报 79.1% 是拿 272 标称做分母，而这张卡从未到过 272。
+
+**再快只能少搬字节**，于是做了 INT8：K 换成 int8（`scale = max|x|/127`，每 (token, head) 一个 fp16 scale）。
+
+- **只量化 K：赢了**。流量 256 → 193 MiB，`1.0419 ms / 194.4 GB/s`，误差 `max_abs ≈ 1e-3`（容差 1e-2）。
+- **K 和 V 都量化：反例**。流量再降到 130 MiB，但时间涨到 `1.2032 ms`——两条流都变成每 lane 1 字节，
+  warp 每条访存指令只带 32 B，同时在飞的字节数掉一半，利用率从 87.8% 掉到 51.2%。
+- **再加 vec4 加载：更差**（`1.5503 ms`，39.7%）；**再加 split-L：只回收 7%**（`1.1223 ms`，54.8%）。
+
+> 结论：**量化省字节，向量化保每指令字节数，两者必须配套**。单向窄流（只 K）能吃到量化的红利；
+> 双向窄流要靠 int8×4 打包才可能回本，而那条路需要重写索引（`d = 4·lane + k`）与归约，本项目没做。
+> 八版本全表（1 个正例 + 3 个反例）见 `kernels/w7_paged_attn_实验过程.md`。
 
 **正确性**：参考实现是 PyTorch 显式循环（fp32 累加），不是 SDPA——decode 没有对应算子，
 用 SDPA 会掩盖 `block_table` 映射错误。已验证 `L=2048`（主循环）与 `L=2049`（收尾块）；
@@ -310,7 +321,11 @@ ncu 用法与"怎么判瓶颈"记在 [`kernels/ncu速查.md`](kernels/ncu速查.
 │   ├── w6_gemm.cu               GEMM 四级台阶（naive / tiling / 4×4 寄存器分块 / wmma Tensor Core）
 │   ├── w7_paged_attn_split.cu   PagedAttention decode split-L（1.2483 ms，97.2% 实测带宽）
 │   ├── w7_paged_attn.cu         单链 2 路展开版（1.5084 ms）
-│   ├── w7_paged_attn_实验过程.md   w7 的完整实验记录（台阶表 / 机制 / 为什么停）
+│   ├── w8_paged_attn_int8.cu    INT8 只量化 K（1.0419 ms，本项目最优）
+│   ├── w8_paged_attn_int8kv.cu  INT8 量化 K+V（反例，1.2032 ms）
+│   ├── w8_paged_attn_int8kv_vec4.cu  再加 vec4 加载（反例，1.5503 ms）
+│   ├── w8_paged_attn_int8kvsplit.cu  再加 split-L（反例，1.1223 ms）
+│   ├── w7_paged_attn_实验过程.md   PagedAttention 全部八版的实验记录（台阶表 / 机制 / 为什么停）
 │   ├── GEMM台阶4-不达标分析与优化.md   台阶4 的定位过程与 tile 选择推导
 │   ├── CUDA错题本.md            77 条真实错误与修正（E-01~E-72 + K-01~K-05，按主题分组）
 │   ├── ncu速查.md               ncu 命令、指标含义、存储分级、怎么判瓶颈
@@ -365,8 +380,9 @@ ncu --clock-control none --set full -c 1 \
   台阶 4b（64×64 tile）反而慢 35%，原因是 24 KB 共享内存把每 SM 驻留 block 数从 12 压到 3、屏障无法被掩盖。
   这条负结果比正结果更能说明"tile 大小要与占用率一起算"。未做：128×128 tile + `cp.async` 双缓冲流水。
 - **bench 与 ncu 两把尺子差 40%，原因未定论**（已排除降频/入队/分配器），见上方口径说明。
-- **PagedAttention decode 已达实测带宽 97.2%**（1.2483 ms，215.1 GB/s），剩余空间 2.5%；
-  再快只能减字节，下一步是 INT8 KV cache（预期 0.65–0.70 ms）。
+- **PagedAttention decode 最优是 INT8 只量化 K**（1.0419 ms，194.4 GB/s = 87.8% 实测带宽）；
+  fp16 版是 1.2483 ms / 97.2%。量化把流量从 256 降到 193 MiB，但窄流也把利用率拉低了 10 个点。
+  **KV 全量化的四条分支全是反例**（1.12–1.55 ms），原因与验证过程写在实验记录里。
 - **PagedAttention 的 `L < BS`（不足一块）分支尚未验证**，只测过 `L=2048` 与 `L=2049`。
 - **PyTorch 基线不是 SDPA**：decode 阶段没有对应的 torch 算子，参考实现是显式循环（8.36 ms），
   所以 6.70× 的加速比**不能**拿去和 SDPA 比较。

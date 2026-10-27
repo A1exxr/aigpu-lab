@@ -25,14 +25,13 @@ torch_extensions/
 .DS_Store
 Thumbs.db
 
-# 本地备份 / 草稿（不入库）
+# 本地草稿 / 备份 / 中间产物（不进仓库）
 *.bak
 *.bak-*
 *.bak2
-
-# 运行残留
-kernels/results/
 kernels/111.cu
-
-# 笔记原文：体积大、且只有自测清单有展示价值
+kernels/带宽test.py
+kernels/自测-*.md
+kernels/w7_paged_attn2.cu
+kernels/results/
 notes/cuda-guide-读书笔记.txt
