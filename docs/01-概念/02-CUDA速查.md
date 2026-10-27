@@ -251,4 +251,4 @@ float my_rms = s[0];      // 所有线程都拿到
 
 ---
 
-*配套文档：`kernels/如何写第一个kernel.md`（增量阶梯 + 按症状查坑）、`kernels/README.md`（5 个必须回答的问题）。*
+*配套文档：`docs/01-概念/01-如何写第一个kernel.md`（增量阶梯 + 按症状查坑）、`kernels/README.md`（5 个必须回答的问题）。*

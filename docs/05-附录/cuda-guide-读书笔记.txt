@@ -1,0 +1,1197 @@
+在 CUDA 矩阵操作中，x 永远是列（Col），y 永远是行（Row）
+
+2.1.9 Variable Specifiers（重要）
+CUDA 可以在静态变量声明上使用不同的说明符，以控制变量存放在哪种内存空间中：
+device：变量存放在 Global Memory（全局内存）中
+constant：变量存放在 Constant Memory（常量内存）中
+managed：变量作为 Unified Memory（统一内存）存放，由 CUDA runtime 和驱动自动在 CPU 与 GPU 之间迁移
+shared：变量存放在 Shared Memory（共享内存）中
+
+示例：  __device__ int globalVar;
+        __constant__ float coeffs[16];
+        __managed__ int managedCounter;
+而 shared 一般在 kernel 内声明  
+注：shared  变量属于一个 thread block：同一个 block 中的所有线程都能访问它，但不同 block 之间互不共享。它的生命周期只持续到该 block 执行结束。
+    如果在 device 或 global 函数内部声明变量而不加任何说明符，那么编译器会尽可能把它放到寄存器（register）中；
+    如果寄存器不够，或者变量无法放入寄存器（例如较大的局部数组、动态索引数组），则会退化到 local memory。
+    所谓 local memory 实际上位于设备全局内存中，但只对当前线程可见，因此访问速度通常比寄存器慢
+
+
+
+2.2.3 GPU Device Memory Spaces
+访问速度从快到慢大致为：Register > Shared Memory > Constant Cache > Global / Local / Texture Memory
+其中：
+    Register 和 Shared Memory 位于 SM 的片上内存（on-chip），延迟最低。
+    Global、Local、Texture 位于显存（off-chip device memory）中，因此延迟较高。
+    Constant Memory 虽然也位于显存中，但有专门的常量缓存，因此在广播访问模式下会更快。
+
+
+
+2.2.3.2 Shared Memory
+对于图片shared_memory：并没有通过for或while循环读取数据，一个线程就会执行一次kernel核函数，一共256个线程，执行了256次，一口气就把数据从显存（global memory）搬到了共享内存上
+在 CUDA 中，__shared__ 内存的作用域是“一个 Block”。有多少个 Block，物理上就有多少份独立的 tile 副本。逻辑名虽然相同，但物理地址完全不同。
+所以，在第一个block里面：线程 0 执行：tile[0] = A[0]；线程 1 执行：tile[1] = A[1] ... 线程 255 执行：tile[255] = A[255]
+    在第二个block里面：线程 0 执行：tile[0] = A[256]；线程 1 执行：tile[1] = A[257]... 线程 255 执行：tile[255] = A[511]
+
+由于 shared memory 可被 block 中所有线程访问，因此必须小心避免数据竞争（data race）。CUDA 提供了同步函数 __syncthreads()
+它会阻塞当前 block 中的所有线程，直到 block 中每个线程都执行到这一行，之后大家才会继续执行
+通常在：某些线程写 shared memory，而其他线程随后要读这些数据，之间插入 __syncthreads()，否则可能有的线程还没写完，其他线程就已经开始读取，从而得到错误结果
+
+shared memory也分静态（设置内存固定大小）和动态（不固定）
+__shared__ float tile[256];
+extern __shared__ float tile[] ————> 在启动 kernel 时指定大小： kernel<<<grid, block, 256 * sizeof(float)>>>();
+如果需要多个动态 shared memory 数组，则只能声明一个 extern shared 数组，然后手动切分
+
+
+Registers（寄存器）位于每个 SM 上，并且具有线程私有（thread-local）作用域。也就是说，每个线程都有自己独立的一组寄存器，其他线程无法访问。
+4060显卡 每个SM上有65536个32位寄存器 
+一个 SM 最多支持 1024 个并发线程 ————> 65536 个寄存器 / 1024 个线程 = 64 个寄存器/线程 ————> 在默认情况下，每个线程最多能用 64 个寄存器
+假设 kernel 每个线程使用 64 个寄存器、每个 block 有 256 个线程，则一个 block需要 64 * 256 = 16384 个寄存器，因此一个SM最多驻留 65536 / 16384 = 4个block
+寄存器使用量越大，可同时运行的 block / warp 越少，因此 occupancy（占用率）可能下降
+
+NVCC 提供了 -maxrregcount 编译选项，允许开发者限制 kernel 最多可使用多少寄存器
+例如：nvcc -maxrregcount=64 my_kernel.cu  这表示编译器尽量让每个线程最多只使用 64 个寄存器
+
+但当寄存器被限制的太低，会出现寄存器溢出，多余变量会被“spill”到 local memory 中，而local memory物理上位于global memory中，因此访问它的延迟远高于寄存器，性能可能反而下降
+
+
+
+2.2.4.1. Coalesced Global Memory Access  合并全局内存访问
+全局内存是以 32 字节（32-byte）为单位进行访问的。当一个 CUDA 线程从 global memory 请求一个数据字（word）时，所在 warp 会把该 warp 中所有线程的内存请求合并（coalesce）成尽可能少的内存事务
+取决于：
+    每个线程访问的数据大小
+    各线程访问地址的分布情况
+如果每个线程请求一个 4 字节的数据，那么 warp 实际向 global memory 发出的最小事务仍然是 32 字节
+为了最高效地利用内存系统，一个 warp 最好能够使用一次内存事务取回的全部数据
+实现 coalesced memory access（合并内存访问）最直接的方法，就是让连续的线程访问连续的内存元素，这只是最常见、最容易写出的模式
+真正的条件是：一个 warp 中所有线程访问的地址，只要落在尽可能少的 32-byte 内存段（segment）中，就能够被硬件合并为少量内存事务。线程访问这些地址时可以是线性的，也可以是打乱顺序（permuted）的。
+确保全局内存访问是良好coalesced的，是编写高性能CUDA kernel时的最重要的性能因素之一  
+
+
+
+2.2.4.1.1. Matrix Transpose Example Using Global Memory  矩阵转置
+索引宏定义（用于行优先存储）
+为了在一维数组（1D global memory）中表示二维矩阵，数学上的二维坐标（第几行，第几列）”翻译成“计算机内存里的一维偏移量（第几个位置），使用如下宏：
+#define INDX(row, col, ld) (((row) * (ld)) + (col))   这是 CUDA/C++ 中处理二维矩阵时最基础、最标准的写法
+其中： 
+    row：要访问的行索引（从 0 开始）
+    col：要访问的列索引（从 0 开始）
+    ld：Leading Dimension（主维度） 的缩写。在行优先（Row-major）存储中，它代表矩阵一行包含的元素总数（即列数）
+原理：想找第 row 行、第 col 列的元素 ————> 跳过前面的整行：前面有 row 行，每行有 ld 个元素，所以前面共有 row * ld 个元素 ————> 加上列偏移：在当前行内，前面有 col 列，所以再往后走 col 步
+例子：  // 读取原矩阵 a 的 (row, col) 元素
+        float val = a[INDX(row, col, N)]; 
+        // 写入目标矩阵 c 的转置位置 (col, row)
+        c[INDX(col, row, N)] = val;
+    读的时候用 INDX(row, col, N)，因为原矩阵是按行存的; 读操作会连续访问a中的列元素，在内存中是连续的，所以读操作是 coalesced（全局内存访问可合并）
+    写的时候用 INDX(col, row, N)，因为转置矩阵里，原矩阵的行变成了列。但注意，这里的 N 没变，因为目标矩阵也是 N × N，每行依然有 N 个元素； 
+    写操作每递增1，实际访问的内存地址跨度是一整行的距离，所以写全局内存的访问不是 coalesced
+    改进方法：使用 shared memory 可以先把数据读入片上缓存，然后再按转置后的顺序写回全局内存，从而令读写都变成 coalesced 访问
+
+
+
+2.2.4.2. Shared Memory Access Patterns  看图片
+在 CUDA 设备上，共享内存被划分为 32 个独立的 banks，每个bank以4字节为单位存储数据，连续的 32‑bit words map 到连续的 banks
+当同一个 warp 中的多个线程 请求访问不同的 shared memory 地址，但这些地址属于同一个 bank 时，硬件无法同时满足这些请求：
+Bank conflict 取决于访问 stride 与 bank 数的关系：
+                                                stride 与 32 互质 → 通常无冲突
+                                                stride 是 32 的因子 → 可能造成 bank conflict
+但如果多个线程访问的是“同一个地址”（比如都去读 smem[0][0]），硬件会把这一个值“广播”给所有线程，这完全不算冲突，速度极快
+
+
+
+
+2.2.5. Atomics  了解
+对于整个 grid 级别，并不存在一种机制来同步 grid 中的所有线程。不过有一种机制可以对全局内存位置进行同步访问 —— 即使用原子函数
+原子函数允许线程对一个全局内存位置获得锁并执行读‑修改‑写操作。当某线程持有这个锁时，其他线程无法访问同一内存位置
+#include <cuda/atomic>
+cuda::atomic<Type, Scope> atomic_variable{initial_value};
+
+
+
+2.2.6. Cooperative Groups 了解
+允许程序定义线程组（thread groups），这些线程组可以在运行时进行协同操作和同步，即使这些线程跨越了多个线程块（thread blocks）、单个 GPU 上的多个 grid，甚至是跨多个 GPU
+
+
+
+2.2.7. Kernel Launch and Occupancy 重要
+内核的占用率（Occupancy） 是指某个时刻在 SM 上活跃的 warp 数与该 SM 支持的最大活跃 warp 数的比值。高占用率通常能更好地隐藏延迟，提高性能（尽管高占用率并不总是意味着性能最优，但常被作为优化指标）
+以下资源使用情况会影响 occupancy： 
+                                每个线程块的线程数（由程序员显式设置）
+                                共享内存使用量（程序中分配的共享内存）
+                                寄存器使用量：虽然编译器和运行时会尝试自动优化寄存器分配，但程序员可以通过 --maxrregcount 编译选项来限制每个线程块的最大寄存器数。
+                                            若内核需要更多寄存器而超过该限制，则可能发生寄存器溢出（spill），导致一些变量溢出到本地内存，从而改变性能行为。
+在某些情况下，即便发生寄存器溢出，降低寄存器使用仍然可以让更多线程块驻留在 SM 上，从而提高占用率和整体性能
+比如4060显卡：
+            最大线程数 / SM	    1536
+            最大线程块 / SM	    32
+            最大线程数 / Block	1024
+            最大寄存器数 / SM	65536
+            最大共享内存 / SM	100 KB
+            最大共享内存 / Block	48 KB
+
+
+2.3. Asynchronous Execution  （异步执行）
+指的是 CPU（主机） 的行为。当 CPU 调用 GPU 启动内核或拷贝数据时，CPU 不等待 GPU 干完活，立马返回继续执行下一行代码
+
+2.3.1 Asynchronous Concurrent Execution （异步并发执行）
+指的是 GPU（设备） 内部的行为。在 CPU 异步发起命令的基础上，GPU 内部的多个操作（比如数据拷贝和计算）同时重叠进行
+核心关系：异步执行（CPU不阻塞）是前提，并发执行（GPU重叠干活）是结果
+
+
+实现异步的 API 工具：
+1. Stream（流）：相当于一个 “任务传送带”。
+同一根传送带上（同一个 Stream），任务按顺序执行（先拷数据，再算内核）。
+不同传送带（不同 Stream）之间，任务可以并行执行（传送带A在拷贝，传送带B在计算）。
+
+2. Event（事件）：相当于在传送带上插了一个 “小红旗”。
+可以用来标记“这个任务干完了”。比如你想等 kernel1 算完，但不等 kernel2 算完，就用 Event 插在它们中间做分界。
+
+3. CUDA Graph（图）：本文只提了概念。你可以把它理解为 “预制好的整套流水线图纸”，重复执行时不需要再跟 CPU 来回沟通，调度开销几乎降为 0。
+
+
+异步调用后要“同步”，三种方式：
+1. 阻塞（Blocking）：应用程序调用一个会阻塞的函数，直到该操作完成为止。
+cudaDeviceSynchronize()、cudaStreamSynchronize(stream)、cudaEventSynchronize(event)
+
+2. 非阻塞方式（non-blocking approach），也称轮询方式（polling approach）：应用程序调用一个会立即返回的函数，该函数会提供操作当前状态的信息。
+cudaStreamQuery(stream)、cudaEventQuery(event)
+
+3. 回调方式（callback approach）：当操作完成时，预先注册的函数会被自动执行。
+cudaLaunchHostFunc()  ————> cudaLaunchHostFunc(stream, hostFunction, data);
+                            当 stream 中前面的操作完成后，hostFunction 会在 CPU 上自动执行。需要注意的是，在该回调函数内部不能再调用 CUDA API。
+
+
+
+2.3.2. CUDA Streams  重要
+一个 Stream 的行为类似于工作队列（work queue），程序可以向其中添加操作，这些操作的执行顺序是串行的：操作会严格按照它们被加入（enqueue）到 Stream 中的顺序执行
+
+2.3.2.1. Creating and Destroying CUDA Streams  重要
+通过 cudaStreamCreate() 创建CUDA stream
+// cudaStream_t stream;
+// cudaStreamCreate(&stream);           但这样创建的 流 会和默认流0 共享路口        ———— 默认创建（阻塞）
+// cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);  ———— 非阻塞创建，不受默认流0的影响，是独立的 流
+分配任务：
+    cudaMemcpyAsync(d_a, h_a, size, cudaMemcpyHostToDevice, stream);
+    myKernel<<<grid, block, 0, stream>>>(d_a);
+会按照顺序执行
+通过 cudaStreamDestroy(stream); 来销毁流，即时流上还有未完成的任务，函数也会立刻返回，等任务结束，流自动被销毁
+
+注：看图片120
+    cudaMemcpyAsync 名字里带 “Async”，但不代表它真的会异步，要让拷贝和计算真正重叠（并发），CPU 主机内存（h_data）必须是“页锁定内存（Pinned Memory）”
+// float* h_data = (float*)malloc(size);
+// cudaMemcpyAsync(...)                 这是假异步，没有任何性能提升，该等多久还是等多久
+而      
+// cudaMallocHost(&h_data, size);
+// cudaMemcpyAsync(...)                 这是真异步，拷贝和计算完美重叠
+只要使用 Async 系列函数，就必须配套使用 cudaMallocHost 来分配主机端内存
+
+
+2.3.2.2. Launching Kernels in CUDA Streams
+要把一次内存传输放入某个 CUDA stream 中，可以使用 cudaMemcpyAsync()，它与 cudaMemcpy() 基本相同，只是额外多了一个参数，用来指定该拷贝属于哪个 stream
+cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream);
+注：与 cudaMemcpy() 不同，cudaMemcpyAsync() 会立即返回，不会等待数据传输完成。真正的数据传输会在 GPU 后台继续执行，因此 CPU 可以立刻去做别的事情
+
+
+2.3.2.4. Stream Synchronization
+cudaStreamSynchronize(stream)阻塞当前 CPU 线程，直到指定 stream 中之前提交的所有操作全部完成，不会阻塞其他stream的执行。也就是说，它会等待该 stream “清空”
+如果不想阻塞，只想检查 stream 是否已经完成，可以使用 cudaStreamQuery(stream)
+cudaError_t status = cudaStreamQuery(stream);  只返回两种结果，完成 或 还在执行  ———— cudaStreamQuery() 会立即返回，不会等待
+
+
+
+2.3.3. CUDA Events  重要
+CUDA Events 可以用cudaEventCreate()来创建，cudaEventDestroy()进行销毁
+// cudaEvent_t event;
+// cudaEventCreate(&event);
+// cudaEventDestroy(event);
+在 CUDA 中，核函数启动和异步拷贝对于 CPU 而言是非阻塞的。CPU 只负责按代码顺序‘发射’任务，而不等待任务完成，除非显式调用同步函数
+Event可以应用于两个场景：单流里精确等待 和 跨流依赖等待
+    单流等待（CPU 等 GPU）    关键 cudaEventSynchronize(event) ————  等多久？	如果 GPU 跑完了，瞬间返回（零开销）；没跑完就死等
+    // cudaEventRecord(event, stream);   在 Stream 中插旗
+    // ... 此处可以穿插 CPU 自己的复杂计算（并行窗口） ...
+    // cudaEventSynchronize(event);      CPU 在此停下，直到旗子亮灯
+    //  旗子亮灯后，CPU 继续执行（此时旗子后面的任务可能还在跑）
+--------------------------------------------------------------------------------------------------------------
+    跨流依赖等待（GPU 等 GPU）  关键 cudaStreamWaitEvent(stream2, event, 0)    GPU（特定的 Stream2） 的任务队列被暂停。CPU 完全不阻塞
+    // Stream 1 干活
+    kernel1<<<..., stream1>>>(data);
+    cudaEventRecord(event, stream1);   // 在 Stream1 上插旗
+
+    // Stream 2 等待
+    cudaStreamWaitEvent(stream2, event, 0); // Stream2 门口上锁（等旗亮）
+    kernel2<<<..., stream2>>>(data);       // 锁开后，内核才开始执行
+--------------------------------------------------------------------------------------------------------------
+
+cudaEventSynchronize(event);  阻塞CPU等待event执行结束，假设有两个kernelA、kernelB核函数，如果cudaEventSynchronize(event)设置的足够远，期间KernelB都运行结束了，
+它依然有意义，cudaEventSynchronize 就像给程序买了一份“保险”。显卡跑得快，保险就白买（零开销）；显卡跑得慢，保险立刻生效（拦住 CPU，保证正确）。不要因为偶尔不阻塞就删掉它，它保证了代码的绝对正确性。
+注意：  
+    同一个 event 可以多次调用 cudaEventRecord()，后一次会覆盖前一次记录的状态
+    cudaStreamWaitEvent() 使用的是调用当时 event 的状态，不会被之后再次 cudaEventRecord() 修改
+
+
+
+2.3.3.3. Timing Operations in CUDA Streams   重要
+CUDA Event 到达 stream 前端时会记录一个时间戳。因此，只要在 kernel 前后各插入一个 event，就可以测量该 kernel 的执行时间
+start 会在 kernel 开始执行前被触发
+stop 会在 kernel 执行结束后被触发
+float elapsed_ms = 0.0f
+cudaEventElapsedTime(&elapsed_ms, start, stop) 返回两个 event 之间的时间，单位是毫秒，精度大约 0.5 微秒
+
+
+2.3.3.4. Checking the Status of CUDA Events
+通过非阻塞方式 cudaEventQuery(event) 来检查某个 event 是否已经完成
+与 cudaEventSynchronize() 不同，它会立即返回，因此 CPU 可以一边做自己的工作，一边偶尔“偷看”一下 GPU 是否已经执行到了该 event
+
+
+
+2.3.4. Callback Functions from Streams  初学仅了解 也可以 跳过
+cudaLaunchHostFunc(stream, hostFunction, &cbData) 是在 Stream 队列里插一个“CPU 中断点”。当 GPU 跑完前置任务后，CPU 会立刻执行你指定的函数。
+函数签名：
+cudaError_t cudaLaunchHostFunc(
+    cudaStream_t stream,            // 要把回调函数插入到哪个 CUDA stream 中
+    void (*func)(void *),           // 这是一个函数指针，指向一个你自己写的、返回值为空、且只接受一个 void* 参数的 CPU 函数；当 stream 中此前所有操作完成后，要在 CPU 上执行的函数
+                                    // (*func)：表示 func 是一个 指针变量；  (void *)：表示这个被指向的函数 接受一个参数，这个参数的类型是 void*（万能指针）
+                                    // 在写回调函数时，只关心函数签名（返回值是 void，参数是 void*万能指针）。至于它怎么变成函数指针、怎么被调用，那是 API 内部的事，我只需要在调用 API 时把函数名（不加括号）传进去就行了
+    void *data                      // 传递给该函数的用户数据指针
+);
+被调用的 host 函数本身必须具有如下签名：
+void hostFunction(void *data)
+{
+    // CPU 上执行的逻辑
+}
+其中 data 通常指向一个用户自定义结构体，用于把需要的信息传给回调函数
+非常重要的限制是：hostFunction 内部不能调用任何 CUDA API
+
+cudaLaunchHostFunc() 更适合用于：
+                                通知 CPU 某个 GPU 阶段已经完成
+                                设置标志位
+                                唤醒另一个线程
+                                启动纯 CPU 计算
+
+
+
+2.3.4.2. Asynchronous Error Handling  了解
+由于 kernel launch、异步 memcpy 等操作是在 stream 中异步执行的，因此错误通常不会立刻返回给 CPU，而是在后续同步点（如 cudaStreamSynchronize()、cudaEventSynchronize()）才暴露出来
+CUDA 提供了两种方式来查询当前上下文中的最后一个错误：cudaGetLastError() 和 cudaPeekAtLastError()
+cudaGetLastError()：返回最后一个错误；同时将错误状态清零（重置为 cudaSuccess）
+cudaPeekAtLastError()：返回最后一个错误；不会清除错误状态，因此后续仍可再次读取该错误
+
+CUDA_CHECK( kernel<<<grid, block>>>(...) )不可以这样写，因为kernel<<<>>>()是一个语句，返回值是void，而CUDA_CHECK返回值是一个cudaError_t 类型的值，所以不能把内核直接塞进去
+
+要检查内核的问题，可以这样写
+kernel<<<grid, block>>>(...);
+CUDA_CHECK( cudaGetLastError() );       // 把 cudaGetLastError() 的返回值塞进宏
+CUDA_CHECK( cudaDeviceSynchronize() );  //  检查执行
+
+
+
+2.3.6. Blocking and non-blocking streams and the default stream  务必理解
+CUDA 中有两类 stream：blocking stream;  non-blocking stream  这里的blocking和non-blocking并不是指 stream 本身是否异步，
+                                                            而只是指该 stream 是否会与默认 stream（default stream，也叫 stream 0 或 NULL stream）发生隐式同步
+比如：
+    cudaStream_t stream1, stream2;
+    cudaStreamCreate(&stream1);         
+    cudaStreamCreate(&stream2);
+    kernel1<<<grid, block, 0, stream1>>>(...);
+    kernel2<<<grid, block>>>(...);              // 默认 stream
+    kernel3<<<grid, block, 0, stream2>>>(...);
+由于 stream1 和 stream2 都是 blocking stream，因此默认 stream 中的 kernel2 会自动与它们同步  ———— kernel1 -> kernel2 -> kernel3
+cudaStream_t stream;
+cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);   这样创建的stream就是 非阻塞流
+
+注：一个常见的错误
+普通的 cudaMemcpy() 会隐式使用默认 stream。因此如果你使用了 non-blocking stream，再写：
+    kernel<<<..., stream>>>(...);
+    cudaMemcpy(h_data, d_data, size, cudaMemcpyDeviceToHost);
+这里的 cudaMemcpy() 并不会自动等待 non-blocking stream 中的 kernel 完成，可能导致读到尚未写完的数据。对于 non-blocking stream，应优先使用：
+    cudaMemcpyAsync(h_data, d_data, size, cudaMemcpyDeviceToHost, stream);  并在同一个 stream 中保证顺序
+
+
+
+2.3.6.1. Legacy Default Stream   必须理解
+通过cudaStreamCreate创建的流都是 阻塞流
+默认流（Stream 0，也叫 NULL 流）：
+    1. 这个默认流是所有主机线程共享的：意味着 Stream 0 不是某个线程的专属通道。无论是主线程还是子线程，只要把任务丢进 Stream 0，大家都是挤在同一座窄桥上排队，没有隔离性
+    2. 它是一个阻塞流：这个流里的任务，会强制 GPU 把它前面的任务全部清空。它会“堵住”其他流的执行
+    3. “默认流”与“普通阻塞流”之间，遵守的是“绝对串行（不能重叠）”原则，谁的“启动指令”先被 CPU 丢进 GPU，谁就先跑；另一个无论身份如何，都必须在后面排队等着，不得同时运行。
+
+绝对禁止在同一程序里混用 默认流 和 其他阻塞流
+最推荐的写法，就是全部创建为 非堵塞流
+
+
+
+2.3.6.2. Per-thread Default Stream  必须理解
+可在nvcc编译时加入命令  --default-stream per-thread
+每个线程的默认流，从“阻塞流”自动变成了“非阻塞流”，这个命令和用 cudaStreamCreateWithFlags(..., cudaStreamNonBlocking) 创建的自定义流完全一致。
+此时，写cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice)（不指定流），也不用担心它会卡住别的流或别的线程，它会自动被分发到当前线程的私有默认流里，和其他流和平共处
+
+或者在包含 cuda_runtime.h 之前 写 #define CUDA_API_PER_THREAD_DEFAULT_STREAM   但这个只对当前.cu文件有效
+
+
+
+
+2.3.7. Explicit Synchronization  必须理解
+cudaDeviceSynchronize() 会等待所有 host 线程中的所有 stream 里、此前提交的命令全部执行完成
+cudaStreamSynchronize() 接收一个 stream 作为参数，并等待该 stream 中此前提交的所有命令执行完成；它可以用于只让 host 与某一个特定 stream 同步，而允许设备上的其他 stream 继续执行
+cudaStreamWaitEvent() 接收一个 stream 和一个 event 作为参数；它会使得在调用 cudaStreamWaitEvent() 之后、添加到该 stream 中的所有命令，延迟执行，直到指定的 event 完成为止
+cudaStreamQuery() 提供了一种非阻塞方式，让应用程序检查某个 stream 中此前提交的所有命令是否已经执行完成
+
+
+
+2.3.9. Miscellaneous and Advanced topics
+2.3.9.1. Stream Prioritization 流优先级
+让 GPU 在“排队等待执行的任务”中，优先挑选更重要的任务去执行；它有一个极其重要的限制：它不是“抢占式”的，而是“插队式”的：
+高优先级 stream 中尚未开始执行的 kernel，通常会优先于低优先级 stream 中尚未开始的 kernel 被调度；
+但已经在 GPU 上运行的低优先级 kernel，一般不会因为高优先级 kernel 到来而被强制中断。
+
+数值越小，优先级越高  greatestPriority（最高）通常返回 -1 或 -2；leastPriority（最低）通常返回 0；默认 Stream 的优先级是 0
+不同 GPU 支持的优先级范围不同，因此不要硬编码某个值，而应该先调用 cudaDeviceGetStreamPriorityRange() 查询
+
+目前 stream 优先级通常只影响计算 kernel，不影响内存拷贝：
+   cudaMemcpyAsync() 的 H2D / D2H 传输不会因为 stream 优先级不同而被加速或延后（因为数据拷贝走的是 PCIe 总线（数据传输通道），而内核走的是 SM（计算核心））两者的硬件资源是完全独立的
+    只有 kernel launch 的调度顺序会受到影响
+
+通过cudaStreamCreateWithPriority()创建 有优先级的 流；  其中cudaStreamDefault：标志位，表示这是一个普通的阻塞流；参3是priority参数
+cudaStreamCreateWithPriority(&highStream, cudaStreamDefault, greatest); // 传入 -1
+cudaStreamCreateWithPriority(&lowStream, cudaStreamDefault, least);     // 传入 0
+
+
+cudaMemcpy()和cudaMemcpyAsync()的区别：
+cudaMemcpy()：  调用后，CPU 线程完全卡住，直到数据全部拷完才继续执行下一行代码；
+                强制丢进传统默认流；malloc 分配的普通内存和 cudaMallocHost 分配的固定内存都可以；
+                立即返回错误码
+
+cudaMemcpyAsync()： 调用后，CPU 立刻返回去执行下一行代码；
+                    丢进指定的 Stream 中；最好是 cudaMallocHost 分配的固定内存，不然就会偷偷退化成同步行为
+                    延迟报错
+
+
+
+2.3.9.2. Introduction to CUDA Graphs with Stream Capture
+CUDA Graphs（CUDA 图）：CUDA 中一项“预编译”技术，专门用来解决 “频繁启动大量短小内核（Kernel）导致的 CPU 过载问题”
+CUDA Graph = 把“反复的 CPU 命令提交”降维成“一次录制 + 一次实例化 + N 次极速播放”
+适合场景： 大量短内核、重复执行相同计算流（如 AI 推理中的多层算子调用）
+重要API：
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal)，捕获阶段，stream进入捕获态，此时提交给GPU的任务都不会执行，只记录
+        cudaStreamEndCapture(stream, &graph)，捕获结束，生成图对象 graph(记录下来的操作顺序)
+        cudaGraphInstantiate(&instance, graph, NULL, NULL, 0)，实例化，把 graph 编译成可直接执行的 instance(编译好的、绑定好内存地址的可执行机器码)
+        cudaGraphLaunch(instance, stream)，执行，把 instance 丢进 指定的Stream 执行(GPU 快速执行)
+
+
+2.4. Unified and System Memory
+我电脑目前是 Limited unified memory support；纯 Linux 下，RTX 4060 会自动升级为 Full Unified Memory
+Limited Unified Memory（受限统一内存）
+Windows、WSL 和部分 Tegra 上通常属于这种模式，其限制包括：
+    1. managed memory 首先分配在 CPU DRAM 中
+    2. GPU kernel 启动时，数据整体迁移到 GPU
+    3. kernel 执行期间 CPU 不允许访问这块 managed memory
+    4. cudaDeviceSynchronize() 后，数据再迁回 CPU
+    5. 不支持 oversubscription（不能分配超过 GPU 显存大小的 managed memory）
+    6. 只有 cudaMallocManaged 分配出来的内存才受支持
+
+在 WSL 上，cudaMallocManaged 本质就是“加了语法糖的自动拷贝”：内核启动前拷进去，同步后拷出来。
+
+
+
+2.4.1. Unified Virtual Address Space    了解
+Unified Virtual Address Space（UVA，统一虚拟地址空间）表示：在同一个进程中，CPU 内存和所有 GPU 的 global memory 都被映射到一个统一的虚拟地址空间里
+Global Memory：指 GPU 板载的物理显存（DRAM）
+用 malloc（CPU）、cudaMalloc（GPU）、cudaMallocHost（固定内存）或 cudaMallocManaged（统一内存），拿到的指针值都处于同一个虚拟地址空间中，只是不同硬件（CPU、GPU0、GPU1）占用不同的地址段
+
+通过 cudaPointerAttributes attr;
+     cudaPointerGetAttributes(&attr, ptr)，你可以随时查这个指针来自哪块内存（Host、Device、Managed）以及属于哪张 GPU 卡。这在调试多卡程序时极其有用。
+attr.type 返回枚举值(cudaMemoryTypeHost、cudaMemoryTypeDevice、cudaMemoryTypeManaged)，如果是 device memory，还能通过 attr.device 得知它属于哪块 GPU
+
+测试后，我电脑支持UVA
+UVA 带来的第二个重要好处是：cudaMemcpy 不再需要显式写明 copy 的方向，可以直接写：
+    cudaMemcpy(dst, src, size, cudaMemcpyDefault);
+另外，cudaMallocHost() 和 cudaHostAlloc() 分配的 pinned host memory，在支持 UVA 的设备上会自动映射到 GPU 可见地址空间，就是说GPU可以直接通过PCIe访问这些内存，不需要拷贝到GPU上再访问
+但这仅限于小数据时，大张量训练/推理（> 1MB）就绝对不要用了，带宽严重不足，会成为系统瓶颈，此时还是用 cudaMemcpy 拷进显存
+
+
+
+2.4.2. Unified Memory    务必理解
+Unified Memory 是 CUDA 提供的一种内存机制，它允许一块“managed memory”同时被 CPU 代码和 GPU kernel 访问
+在某些系统上，managed memory 需要显式分配。CUDA 支持两种主要方式：
+float *p;
+cudaMallocManaged(&p, N * sizeof(float));
+和 __managed__ int counter;
+
+不过，在支持 HMM 或 ATS 的系统上，情况会进一步简化：所有系统内存天然就是 managed memory ———— 所有主机内存都可以通过主机指针直接被 GPU 访问
+例如：float *a = (float*)malloc(bytes);  这也可以直接在gpu上访问
+其中：
+    HMM（Heterogeneous Memory Management）是 Linux 上的软件一致性方案   
+    ATS（Address Translation Services）是 Grace Hopper / NVLink-C2C 平台上的硬件一致性方案
+
+
+
+2.4.3. Page-Locked Host Memory   必须理解
+普通 malloc 内存（可分页）：操作系统可以随时把它从物理内存搬到硬盘（Swap）上，或者更改它的物理地址。这对 CPU 是透明的，但 GPU 的 DMA（直接内存访问）引擎要求目标地址在传输期间绝对固定。
+页锁定内存（Pinned）：被钉在物理内存的固定位置上，操作系统不能把它换走，物理地址稳定。
+如果 cudaMemcpyAsync 的源/目标是 malloc 内存，驱动会偷偷把数据先拷到内部临时固定缓冲区，这个步骤是同步阻塞的，导致 Async 失去意义。只有 cudaMallocHost 分配的内存才能让 cudaMemcpyAsync 真正异步。
+CUDA Runtime 提供了以下 API 用于分配页锁定主机内存，或者将已有内存变成页锁定内存：
+    cudaMallocHost：分配页锁定主机内存
+    cudaHostAlloc：默认行为与 cudaMallocHost 相同，但还可以通过 flags 指定其他内存参数
+    cudaFreeHost：释放通过 cudaMallocHost 或 cudaHostAlloc 分配的内存
+    cudaHostRegister：将一段已经存在的、非 CUDA API 分配的内存（例如通过 malloc 或 mmap 分配）页锁定；其作用是：即使主机内存是由第三方库或开发者无法控制的代码分配的，也可以将其转换为页锁定内存，以便用于异步拷贝或映射到 GPU
+
+目前我的电脑和WSL环境（Limited UM）情况：
+    CPU 内存用 cudaMallocHost；     固定内存
+    GPU 内存用 cudaMalloc；         显存
+    cudaMemcpyAsync 的源/目标必须用 cudaMallocHost；
+    cudaMemcpy（同步）无所谓用哪种内存
+
+
+2.4.3.1. Mapped Memory     必须理解
+映射内存，也叫零拷贝内存，也是页锁定内存的一个特殊子集
+在 CPU 内存里划出一块“钉住”的区域，然后把这块区域的物理地址，直接映射到 GPU 的虚拟地址空间中。这样，GPU 内核可以直接通过 PCIe 读写这块 CPU 内存，不需要拷贝到显存，也不需要在 CPU 和 GPU 之间来回搬运
+数据传输速度：    
+    显存（VRAM）带宽：~272 GB/s（你的 RTX 4060）
+    PCIe 4.0 x16 带宽：~32 GB/s
+
+对比统一内存
+- 映射内存：数据不动，GPU 远程访问（慢，适合小数据）。
+- 统一内存：数据自动搬家（快，适合大数据，但 WSL 受限）。
+
+映射内存：
+cudaHostAlloc(&h_src, bytes, 参3) 
+参3为： cudaHostAllocDefault（或 0）：内存为页锁定（Pinned），但没有映射到 GPU 地址空间(在没有UVA的环境下)。 
+       cudaHostAllocMapped	页锁定 + 映射到 GPU 地址空间（零拷贝）
+
+
+关于 cudaMallocHost 和 cudaHostAlloc 两个API的用法：
+    cudaMallocHost：当你只需要一块普通的页锁定内存来加速 cudaMemcpy 时，用它最简单直接(在有UVA的环境里，cudaMallocHost 分配的内存，默认就是“自动映射”到 GPU 地址空间的)
+    cudaHostAlloc：当你有额外需求时使用：
+                                        需要零拷贝（映射内存）功能，用 cudaHostAllocMapped；
+                                        需要在多 GPU 环境下共享页锁定内存，用 cudaHostAllocPortable；
+                                        需要优化从 CPU 到 GPU 的数据传输，用 cudaHostAllocWriteCombined；
+
+
+
+2.4.3.1.2. cudaHostRegister
+当 ATS 和 HMM 不可用时，通过系统分配器分配的内存仍然可以使用 cudaHostRegister 映射，使 GPU kernel 能够直接访问
+不过，与通过 CUDA API 创建的内存不同，这类内存不能直接在 kernel 中使用主机指针访问。
+必须先使用 cudaHostGetDevicePointer() 获取一个位于设备地址空间中的指针，然后在 kernel 中使用这个设备指针进行访问
+作用：把一段已经用 malloc（或 mmap）分配好的“普通内存”，在事后“钉住”并“映射”给 GPU 使用，而不需要重新分配内存
+
+3步：
+    // 全局标志设置（main 函数顶部，也就是CUDA上下文初始化之前）———— CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceMapHost)); 
+    // 告诉驱动：“我后面可能要注册映射内存，请启用相关功能。”如果没有这行，cudaHostRegister 会报错
+    cudaHostRegister(ptr, size, cudaHostRegisterMapped) —— 钉住并映射;
+    cudaHostGetDevicePointer(&devPtr, ptr, 0) —— 获取 GPU 可用的指针（随后，必须用 devPtr 传进内核）;
+    内核跑完后，cudaHostUnregister(ptr) —— 解除映射，然后 free(ptr);
+
+
+CUDA 上下文初始化 发生在 “第一次调用需要一个活动CUDA上下文的Runtime API函数时”
+常见的触发函数包括：
+    内存管理：cudaMalloc()、cudaFree()
+    数据传输：cudaMemcpy()
+    内核启动：<<<>>>
+    设备同步：cudaDeviceSynchronize()
+注意：一些简单的查询函数，如cudaGetDeviceCount()，可能不会触发完整的上下文初始化
+
+
+
+2.4.3.1.3. Comparing Unified Memory and Mapped Memory
+注： uint64_t 是一个无符号64位整数类型，它保证在所有平台上都正好是 64 位（0 到 18446744073709551615）
+    size_t 在 64 位系统上也是 64 位，但它主要是为表示“大小”而设计的；而 uint64_t 是精确宽度的无符号整数
+    unsigned long long 虽然通常也是 64 位，但标准不强制（只保证至少 64 位）
+注意对齐与端序：用 uint64_t* 读写数据时，编译器会假设地址是 8 字节对齐的，这在某些平台（包括 GPU）上对性能甚至正确性有影响
+
+原子操作（Atomic Operation） 指的是：这个操作一旦开始，就不会被任何其他操作（来自别的 CPU 核心、或者别的设备）打断，要么一口气全部完成，要么完全不开始
+如果“操作不是原子的”，就意味着这个操作在底层被硬件拆成了好几个小步骤，在这些小步骤之间，其他设备（比如 CPU）可能会看到“做了一半”的中间状态，或者插进来捣乱。
+
+映射内存（mapped memory）能够让 GPU 访问 CPU 内存，但并不能保证所有类型的访问在所有系统上都受支持，例如原子操作（atomics）
+统一内存（unified memory）则保证支持所有访问类型
+
+映射内存（mapped memory）在之前的一些文档中也被称为“零拷贝内存”（zero-copy memory）
+mapped memory（映射内存）和 managed memory（托管内存）是两种不同的机制，而 managed memory 是 Unified Memory（统一内存）功能的具体实现方式
+
+对映射主机内存执行的原子操作（参见 Atomic Functions），从主机或其他 GPU 的视角来看，并不是真正原子的
+GPU 访问 mapped host memory 时，CUDA 只保证“普通读写”在总线上看起来是一个完整的操作，但不保证更复杂的原子语义
+
+映射内存： 
+        永远待在 CPU 内存（DRAM）；
+        GPU访问速度 极慢。每次都要跨 PCIe 总线
+        适用于 小数据（控制信号、Flag、Size）
+        原子操作：假的， atomicAdd 在底层会被拆成 Load-Modify-Store，CPU 可能看到中间值
+        对齐要求： uint64_t* 必须 8 字节对齐，否则数据撕裂
+
+统一内存：
+        自动迁移。谁访问就搬到谁的地盘（CPU 或 GPU）
+        GPU访问速度 极快。一旦迁到显存，享受本地带宽
+        适用于 大数据（张量、矩阵、大数组）
+        原子操作 真的
+        对齐要求 相对宽松
+
+在映射内存上操作 uint64_t 或 float4 时，指针地址必须是 8/16 的倍数。否则 PCIe 总线会拆包，导致读到乱码
+在映射内存上操作，无论是什么数据类型(包括自己写的结构体)，sizeof(T) 多大，指针地址 必须是它的整数倍 
+对齐保证的是：总线上的每一次读/写（Load/Store）操作不会被人为拆散，不会出现“一半新一半旧”的撕裂情况
+
+
+
+
+3. Advanced CUDA
+3.1. Advanced CUDA APIs and Features
+3.1.1. cudaLaunchKernelEx   几乎用不到 暂时不看 <<<>>>完全够用
+<<<>>> 的高级替代版，用于传递 L1/共享内存比例、Cluster 等调优属性。初学者/日常开发无视，遇到性能瓶颈时再回来查 API 参考文档
+
+
+3.1.2. Launching Clusters  不用看 当有一块 H100 / B100 / Grace Hopper芯片，或者写超大规模、多 SM 协同的底层 Kernel 再看
+
+
+3.1.3. More on Streams and Events
+3.1.3.3. Implicit Synchronization（隐示同步）
+如果在两个不同 stream 的命令之间，主机线程执行了下列任意操作，这两个命令就无法并发执行：
+    对页锁定（page-locked）主机内存的分配 cudaMallocHost；
+    对设备内存的分配 cudaMalloc；
+    对设备内存的初始化 cudaMemset；
+    在同一块设备内存的两个地址之间进行内存拷贝 cudaMemcpy；
+    对 NULL stream 的任何 CUDA 操作；
+    L1/shared 内存配置的切换；
+比如：如果stream1和stream2正在并发跑任务，而 CPU 在执行这两个任务期间，突然调用了 cudaMalloc 去申请一块新显存，那么CPU就必须等到cudaMalloc 返回，才能继续执行下面的命令
+
+注：
+    所有内存分配（`cudaMalloc`）放在所有 Kernel 启动之前
+    绝对不要在多个流并发执行期间，往默认流（NULL Stream）里丢任何操作（包括 `cudaMemcpy` 同步版）
+
+
+
+3.1.4. Programmatic Dependent Kernel Launch   暂时不看  熟练掌握了 cudaLaunchKernelEx、CUDA Graph、Stream 优先级等所有前置知识 再回来看
+PDL允许两个 Kernel 部分重叠执行
+
+
+
+3.1.5. Batched Memory Transfers  暂时不看
+cudaMemcpyBatchAsync 做的事情：把 N 个小传输打包成一次“批量传输”，减少 CPU 端的启动开销。
+它比你写 N 次 cudaMemcpyAsync 更快，但前提是传输本身很小（比如几百字节）
+注：异步操作不能读栈变量
+只要遵守“异步拷贝用 cudaMallocHost 内存”这条铁律，你就永远不会遇到这个问题
+
+
+
+3.1.6. Environment Variables    务必理解
+CUDA_DEVICE_MAX_CONNECTIONS —— 解决“流明明独立，却串行执行”
+当创建了 3 个 non-blocking 流（stream1、stream2、stream3），分别提交了 3 个互不依赖的 Kernel，但 GPU 性能监控显示它们没有并发执行，而是排着队串行跑
+原因：GPU 内部有若干条“硬件工作队列（Work Queues）”负责接收 CPU 发来的命令。默认情况下，系统只开放了有限的连接数。如果流太多，几个流可能会共用同一条硬件队列，导致它们被迫排队（即使逻辑上独立）
+可通过  export CUDA_DEVICE_MAX_CONNECTIONS=8   # 增大连接数，给不同流分配不同的硬件队列
+默认值为4 或 8，取决于驱动；先用默认值，若写了多流，性能却没提升，用nvprof 或 Nsight 看到“Stream 串行化”时，再尝试调大这个值（比如调到 16）
+
+
+
+
+3.2. Advanced Kernel Programming
+3.2.1. Using PTX  可忽略
+
+
+3.2.2. Hardware Implementation         了解
+流式多处理器被设计为能够并发执行数百个线程。为了管理如此大量的线程，它采用了一种独特的并行计算模型，称为单指令多线程（Single-Instruction, Multiple-Thread，SIMT）
+
+NVIDIA 的 GPU 架构采用小端序（little-endian）表示方式：一个多字节整数的低字节放在低地址，高字节放在高地址
+做模型量化（Quantization）或保存二进制权重文件时，如果直接按 float / int 的内存布局读写文件，换到不同架构的机器上可能读错。
+标准做法是使用网络字节序转换函数（htonl / ntohl）或者直接用 std::bit_cast + 显式字节序处理
+
+当通过 `char*` 逐字节读取 `int` / `float` 数据，或跨平台传输二进制数据时，必须考虑字节序问题
+
+
+
+3.2.2.1. SIMT Execution Model  SIMT执行模型
+half-warp（半 warp）表示一个 warp 的前 16 个线程或后 16 个线程
+quarter-warp（四分之一 warp）表示一个 warp 的四个 8 线程子组之一
+一个 warp 在任意时刻只执行一条公共指令，因此，当 warp 中全部 32 个线程都沿着同一条执行路径运行时，效率最高
+当同一个warp中，前 16 个线程执行 A()，后 16 个线程执行 B()，硬件会先执行 A()，同时关闭后 16 个线程；再执行 B()，同时关闭前 16 个线程，这种现象称为 branch divergence（分支发散）
+注意，分支发散只会发生在同一个 warp 内部；不同 warp 之间是彼此独立执行的，因此即使不同 warp 走不同代码路径，也不会互相影响
+
+- 老卡（CC < 7.0）：Warp 锁步，所有线程在同一时刻执行同一条指令。
+- 新卡（CC ≥ 7.0，包括我的 4060）：每个线程独立执行（独立程序计数器）。 但分支发散现象仍然存在，写代码时依然要尽量避免 Warp 内发散（
+
+__syncwarp() 是一个 Warp 内部的同步屏障，它强制 Warp 里所有活动线程在这一点上“停下来等”
+
+- 所有 Warp 内的数据共享/归约操作，在读写之间必须加 `__syncwarp()`。
+- 多个线程同时写同一个地址，结果是未定义的，无论新旧卡都是 bug。
+
+
+3.2.2.1.1. Independent Thread Scheduling  独立线程调度
+在计算能力7.0之后，GPU 引入了独立线程调度，GPU 会为每个线程分别维护：程序计数器（PC）；调用栈（call stack）；执行状态
+即使属于同一个 warp 的线程，也可以真正独立地暂停、等待和继续执行；
+因此，一些在旧架构上可运行的代码，在新架构上可能报错，
+如：归约计算
+    shared[tid] += shared[tid + 16];
+    shared[tid] += shared[tid + 8];
+    shared[tid] += shared[tid + 4]; 
+在旧架构里，默认一个warp内，所有线程同步(隐式同步)
+在新架构里，要显示同步：    
+    shared[tid] += shared[tid + 16];
+    __syncwarp();
+    shared[tid] += shared[tid + 8];
+    __syncwarp();
+
+__syncwarp() 会强制指定 warp 中的线程在此处重新同步，确保：
+    所有线程都到达这里；
+    前面的写入已经对其它线程可见；
+    后续代码在所有 GPU 架构上都行为一致；
+
+
+3.2.2.2. Hardware Multithreading
+线程块被划分为 warp 的方式始终相同：每个 warp 都包含线程 ID 连续且递增的一组线程，第一个 warp 包含线程 0
+每个 SM 所处理的 warp，其执行上下文（程序计数器、寄存器等）在 warp 的整个生命周期内始终保存在片上。因此，在 warp 之间切换不会产生任何开销。
+warp 的“执行上下文”，每个 warp 在运行时，都需要保存一份状态：
+    当前执行到哪条指令（Program Counter, PC）；
+    每个线程的寄存器值；
+    哪些线程当前是 active 的；
+    分支栈 / 调用栈；
+
+CPU切线程时通常需要：
+    保存当前线程寄存器；
+    保存 PC；
+    切到另一个线程；
+    恢复另一个线程状态；  这个过程可能要几十到几百 cycle(周期)
+
+GPU 不一样。SM一开始就把很多 warp 的上下文全部保存在片上。比如一个 SM 可以同时驻留几十个 warp。
+于是每个 cycle：
+    cycle 100: 执行 warp 0
+    cycle 101: warp 0 等内存 -> 切 warp 3
+    cycle 102: warp 3 等乘法结果 -> 切 warp 5
+    cycle 103: 执行 warp 8
+并不需要保存/恢复上下文，因此几乎没有成本。
+
+为什么 block 不能拆到多个 SM
+因为一个 block 内的线程需要共享同一块 shared memory。
+如果 block 的一半线程在 SM0，另一半在线程在 SM1，那么它们访问的 shared memory 就不再是同一块了，__syncthreads() 也没法工作。
+
+寄存器用太多，Warp 就少；Warp 太少，内存延迟就藏不住；内存延迟藏不住，SM 就空转。
+nvcc --ptxas-options=-v：查看 Kernel 的寄存器、共享内存用量。
+nvcc -arch=sm_89 -cubin：结合官方 Excel 表（CUDA Occupancy Calculator）看最佳 Block 大小
+
+影响 Warp 数量的因素：
+    寄存器用量（每个线程用的寄存器越多，能放的 Warp 越少）
+    共享内存用量（每个 Block 用的共享内存越多，同时驻留的 Block 越少）
+    Block 大小（Block 太大会让 SM 塞不下多个 Block）
+
+
+
+3.2.2.3. Asynchronous Execution Features 异步执行特性（设备端硬件加速拷贝，跳过暂时不看）
+GPU 内核内部使用专用硬件（如 Ampere 的 `cp.async`、Hopper 的 TMA）异步搬运数据，让线程去干别的活
+这是“极致性能优化”技术，类似手写汇编；如果你未来的工作是需要手写极致优化的算子库，再回头学
+
+
+
+3.2.3. Thread Scopes        线程作用域
+线程作用域定义了：
+    哪些线程能够观察到某个线程的 load 和 store；
+    哪些线程能够使用原子操作、barrier 等同步原语彼此同步。
+可用的线程作用域：thread < block < cluster < device（整个 GPU） < system（CPU + 多 GPU）
+距离越远，同步越贵、越慢。所以 CUDA 不希望你每次都做“全 GPU 同步”，而是让你明确指定：我只需要 block 内同步，还是需要整个 GPU、甚至 CPU 都能看到
+
+一个 scope 同时决定两件事：
+    哪些线程能“看见”你的 store；
+    哪些线程之间可以通过 atomic / barrier 建立同步关系；
+
+如果想进行 读-改-写 操作，必须用原子操作，并指定作用域。
+    如果不指定作用域，硬件为了保证“绝对正确”，默认会使用最保守的 system 作用域，这意味着你每做一次 Block 内的计数器累加，都要跨 PCIe 去同步 CPU 缓存，性能会直接腰斩，甚至崩盘；
+如果是“停在这一步等队友”（Barrier），或者“强制刷新缓存让队友看到数据”（Fence），它们自带作用域，不需要原子变量
+
+原子变量的标准语法是使用 cuda::atomic 模板类
+基本语法：
+    #include <cuda/atomic>
+    cuda::atomic<Type, Scope> atomic_variable{initial_value};
+其中：
+    Type：原子变量的数据类型，例如 int、unsigned int、bool；
+    Scope：线程作用域（Thread Scope），指定了该原子变量对哪些线程可见并可操作，作用域越大，同步的开销也越大；
+    {initial_value}：用花括号进行初始化，原子变量的初始值
+
+作用域参数Scope：
+    cuda::thread_scope_block：表示该原子变量只对同一个线程块（Block） 内的所有线程可见。这是开销最小、速度最快的同步方式
+    cuda::thread_scope_device：对整个 GPU 设备（所有 Block）可见
+    cuda::thread_scope_system：对整个系统（包括 CPU 和其他 GPU）可见
+
+在定义原子变量时，如果是在共享内存中定义 __shared__ 不能用{}来初始化 原子变量的值
+__device__ cuda::atomic<int, cuda::thread_scope_device> flag{0};  这个时候就可以
+
+
+初始化原子变量	flag.store(0, cuda::memory_order_relaxed);
+生产者释放数据	 data = 42;
+                flag.store(1, cuda::memory_order_release);
+消费者等待并获取	while (flag.load(cuda::memory_order_acquire) == 0) {}
+                  int result = data; // 此时一定是最新的
+不加同步的计数器	int idx = counter.fetch_add(1, cuda::memory_order_relaxed);
+
+release 保证了“信号发出时，数据（x）已经躺在仓库里了”；acquire 保证了“当我拿到信号时，我必须去仓库拿最新数据”
+
+CUDA 内存模型 Happens-Before 关系：
+作用域链式传递（Scope Chaining）的概念：通过 Device 作用域的原子变量 a 连接 GPU 内部两个 Block，再通过 System 作用域的原子变量 b 把可见性传播给 CPU
+
+
+
+
+3.2.4. Advanced Synchronization Primitives        跳过
+3.2.4 含 3 类原语：
+    1. Scoped Atomics（已掌握）
+    2. Async Barriers（结合 cp.async）
+    3. Pipelines（多缓冲）。后两者依赖高级异步拷贝，暂不适用当前阶段，跳过
+
+
+3.2.4.1. Scoped Atomics  带作用域的原子操作
+3.2.4.1.1. Thread Scope and Memory Ordering
+Memory Ordering（内存顺序）：定义该原子操作与其他内存操作之间的顺序约束
+即使 cuda::atomic 定义在全局内存中，cuda::thread_scope_block 也只能在同一个 Block 内有效。跨 Block 通信必须用 device 或 system
+
+常见原子操作：
+    写入	.store(value, order)                原子地把值写进去。
+    读取	.load(order)                        原子地读出当前值。
+    取旧值并加	.fetch_add(delta, order)        把 delta 加进去，返回旧值。
+    取旧值并减	.fetch_sub(delta, order)        把 delta 减掉，返回旧值。
+
+建议：
+    尽可能使用最小的作用域
+        Block 作用域（thread_scope_block）：原子操作只在 SM 内部的 L1/共享内存中完成。代价：极低（~几十个时钟周期）。
+        Device 作用域（thread_scope_device）：原子操作必须在 L2 缓存中完成，因为其他 SM 的 L1 缓存看不到，必须通过 L2 做仲裁。代价：高（~几百个时钟周期）。
+        System 作用域（thread_scope_system）：原子操作必须刷新到系统内存，并触发 PCIe 总线事务，甚至要 invalidate CPU 的缓存。代价：极高（~几千个时钟周期）
+
+    优先选择更弱的内存序（Order）
+        计数器累加（fetch_add）：只要不涉及“生产者-消费者”关系，永远用 relaxed
+        发信号（store(1)）：如果你要保证之前的数据（x=42）对消费者可见，必须用 release
+        等信号（while(load()==0)）：如果你要保证看到信号后读取的数据是最新的，必须用 acquire
+
+    优先使用共享内存（Shared Memory）上的原子操作
+    如果你需要做 Block 内的统计（比如每个线程贡献一个值），把计数器放在 __shared__ 上，而不是全局内存。
+    如果你必须跨 Block 通信，计数器才放在全局内存（__device__）。
+
+
+
+3.2.4.2. Asynchronous Barriers 异步屏障  跳过
+最大价值在于配合异步数据拷贝（cp.async）使用
+
+3.2.4.3. Pipelines 流水线  跳过
+专门搭配 Ampere/Hopper 硬件异步拷贝（cp.async / memcpy_async） 使用的“配套设施”
+
+
+
+3.2.5. Asynchronous Data Copies  异步数据拷贝   了解
+异步拷贝（cp.async）：
+    硬件会发起一个“后台拷贝任务”，然后线程立刻恢复执行（去算别的），等需要用到共享内存里的数据时，再用 barrier 或 wait 检查拷贝是否完成。这就实现了 “计算与搬运在同一个 SM 上的重叠”。
+
+**核心区别**：这是 GPU 内核内部的异步（`cp.async`），不是 CPU 端调用 Stream 的异步。
+
+**解决痛点**：传统 `shared[local] = global[global]` 会阻塞线程等待数据。异步拷贝允许线程下发搬运指令后立刻去算别的，等需要数据时再检查是否搬完。
+
+**硬件支持**：Ampere（你的 4060 支持 `cp.async`）和 Hopper（支持 TMA）。
+
+**实战建议**：深刻理解“将发起与等待分离”的思想，但**现阶段不要尝试写 `cp.async` 代码**，等到进阶优化算子库时再回看。
+
+
+
+3.2.6. Configuring L1/Shared Memory Balance  调整 L1 缓存和共享内存（Shared Memory）的分配比例  了解
+SM 上的 L1 缓存和共享内存 共享同一块片上物理 SRAM（比如 100KB），这被称为统一数据缓存（unified data cache）
+    你写的 __shared__ 数组，会占用这块 SRAM 的一部分。
+    剩下的部分，就被用作 L1 缓存，自动缓存你从全局内存读取的数据
+如果一个 kernel 使用的共享内存很少甚至不使用共享内存，那么这块统一数据缓存可以被配置为提供该架构所允许的最大 L1 缓存容量
+
+在 kernel 启动之前，通过调用 cudaFuncSetAttribute 函数来设置 carveout（划分比例），也就是期望分配给共享内存的容量大小
+cudaFuncSetAttribute(kernel_name, cudaFuncAttributePreferredSharedMemoryCarveout, carveout);
+这里的carveout就是该架构所支持的最大共享内存容量的整数百分比  比如设置为20，那就表示为共享内存预留其最大可用容量的 20%
+但这只是一个hint(偏好)，只是希望，驱动程序会根据内核的实际运行情况，最终决定采用何种配置，以保证程序可以运行
+除了使用整数百分比之外，还提供了三个便捷的枚举值作为 carveout 设置：
+    cudaSharedmemCarveoutDefault（默认配置）
+    cudaSharedmemCarveoutMaxL1（最大化 L1 缓存）
+    cudaSharedmemCarveoutMaxShared（最大化共享内存）
+99%的kernel，CUDA 驱动会根据你 Kernel 的实际共享内存用量，自动帮你选择一个“安全”的 L1/Shared 分配比例，保证你的 __shared__ 数组能放下，且剩余空间用作 L1，也就是默认配置。
+所以，大多数情况下， 完全不需要调用。不调用这个 API，驱动程序就会按照默认行为执行，效果等同于传入了默认参数。
+
+CUDA 为了兼容老代码，默认限制每个 Block 的共享内存 ≤ 48KB； 
+需要大于48KB的时候，就设置动态的共享内存， extern __shared__ float buff[];
+然后在启动核函数的时候加上内存大小 kernel<<<grid, block, shared_bytes>>>();
+
+
+
+3.3. The CUDA Driver API  
+Driver API 和 Runtime API
+（cudaMalloc、cudaMemcpy、kernel<<<>>>）都属于 Runtime API（运行时 API）；而 Driver API（驱动 API） 是 Runtime API 的“底层实现”，直接和 NVIDIA 驱动打交道
+Driver API（cu*）是 Runtime API（cuda*）的底层实现，提供了更精细的上下文控制、运行时加载 PTX 的能力。
+Runtime API 是日常开发的绝对主力，Driver API 只在跨语言绑定、JIT 编译、多进程隔离等高级场景才需要
+
+
+3.3.1. Context 上下文  理解概念
+CPU 世界：进程 是一个独立的内存空间（代码、数据、堆栈），进程之间互不干扰。
+
+GPU 世界（CUDA）：上下文（Context） 就是 GPU 上的“进程”。它拥有独立的地址空间（显存映射）、独立的内核模块，以及独立的资源（Stream、Event）。
+
+一个主机线程在任意时刻只能有一个当前设备上下文。当通过 cuCtxCreate() 创建一个上下文时，它会自动成为调用该函数的主机线程的当前上下文。
+现实表现：如果你在线程 A 创建了上下文，若线程 B 想用同一块 GPU 显存，必须先把该上下文“推（Push）”到线程 B 的当前上下文中(这是自己创建的自定义上下文的情况；如果是A和B在同一个GPU内，由驱动
+自己创建的主上下文的话，就不需要推这个动作，它们天然就在同一个上下文里工作)。
+底层原因：GPU 驱动不识别“线程 ID”，只识别“当前线程绑定的是哪个上下文”。当你调用 cuMemAlloc 或 cuLaunchKernel 时，
+        驱动会直接去看“当前线程的上下文”里有没有对应的资源。如果没有，立刻报错 CUDA_ERROR_INVALID_CONTEXT。
+
+对于cuDevicePrimaryCtxRetain() API
+如果你用 Runtime API（cudaMalloc）写了代码，想在同一线程、同一张卡上调用 Driver API 的某个高级功能（比如虚拟内存管理），你不需要做任何额外操作，直接混用即可，因为 Runtime 已经隐式创建了主上下文并将其绑定了当前线程。
+cuDevicePrimaryCtxRetain的作用是：当你需要拿到这个隐式上下文的句柄时，用它来“偷”这个运行时上下文的指针的。拿到后，你就能混用 cuda 和 cu 开头的函数了。
+
+两个核心概念：上下文栈 和 引用计数
+上下文栈（Push/Pop）：
+    cuCtxPushCurrent 和 cuCtxPopCurrent 是用来在临时切换上下文时用的
+    使用场景：当你写一个第三方库时，你不想破坏调用者（比如主程序）的上下文设置，所以你“借用”一下当前线程的上下文，干完活立刻“还回去”。
+    当你调试多线程程序时，如果看到 cudaErrorInvalidContext，你能意识到“当前线程绑定错了上下文”。你会去检查堆栈，看是不是有哪个第三方库临时 Push/Pop 了上下文没恢复。
+
+引用计数：
+    核心规则：一个上下文可以同时被多个线程或模块使用。每个线程“挂载”时计数 +1，“卸载”时计数 -1。只有计数归零，上下文才会被真正销毁。
+
+
+
+3.3.2. Module 模块  理解概念
+模块（Modules）是可动态加载的设备端代码和数据包，类似于 Windows 中的 DLL（动态链接库）。 
+
+应用模块，要知道两个API：cuModuleLoad 和 cuModuleGetFunction
+Driver API 需要显式加载模块（cuModuleLoad），然后从模块里提取函数（cuModuleGetFunction）才能启动内核
+
+这里的加载模块，就是给主程序，加载一些补充的功能(就是模块)，然后把具体功能提取出来(加载函数)，再应用这些功能(启动内核)
+
+DLL就像是游戏外挂：
+    cuModuleLoad 等于 “注入外挂”（把代码塞进显存）
+    cuModuleGetFunction 等于 “选外挂功能”（找到特定 Kernel）。
+    cuLaunchKernel 等于 “按 F1 激活外挂”（让显卡开始干活）。
+
+
+PTX 和 CUBIN 的区别： PTX 是中间语言（跨架构）， CUBIN 是机器码（绑定架构）
+
+CUDA 的编译过程是怎样的？nvcc 是直接生成机器码吗？
+
+不完全是。nvcc 的编译过程分为两个逻辑阶段。
+    首先，它会将 .cu 代码编译成 PTX（并行线程执行中间语言）。PTX 是一种跨架构的中间表示，不绑定具体的 GPU 型号，类似于 Java 的字节码。
+    接着，PTX 会被编译器进一步编译成 CUBIN，这才是 GPU 最终执行的二进制机器码，但它会绑定具体的计算架构（比如 sm_89）。
+    不过，nvcc 默认输出的不是纯 CUBIN，也不是纯 PTX，而是一个‘胖二进制（Fat Binary）’。这个胖二进制文件里同时打包了 PTX 和一个或多个架构的 CUBIN。
+这样做的好处是兼顾了性能和兼容性：程序运行时，驱动会优先选择匹配当前 GPU 的 CUBIN 直接执行（速度最快）；
+如果找不到匹配的 CUBIN（比如换了一张未来新架构的显卡），驱动会回退到 PTX，通过即时编译（JIT）把它动态编译成当前架构的机器码，确保程序依然能跑。
+
+
+3.3.3. Kernel Execution 完全不用看
+只需要知道 cuLaunchKernel 是 Driver API 里用来启动内核的函数就行了
+
+
+3.3.4. Interoperability between Runtime and Driver APIs     混合使用 Runtime API 和 Driver API    了解
+在同一线程、同一张卡，混用 Runtime 和 Driver 的分配/拷贝/启动函数，不需要使用 cuDevicePrimaryCtxRetain
+当  把上下文句柄（CUcontext）作为变量传给另一个 Driver APIs；
+    手动把当前上下文切换到另一张卡（Driver 风格）；
+    让线程 B 操作线程 A 在卡 0 上分配的显存（跨线程共享）时，都需要使用 cuDevicePrimaryCtxRetain，拿到句柄后，才可以混用
+
+
+
+3.4. Programming Systems with Multiple GPUs   多 GPU 编程  务必理解
+多 GPU 编程的本质：
+    多上下文（隔离）：每个 GPU 有自己的上下文，显存地址空间独立。
+    数据分片（Sharding）：把大模型按层或按 batch 切分到多张卡。
+    并行执行（Launch）：多个 CPU 线程（或同一线程切换上下文）各自启动 Kernel。
+    通信（Communication）：GPU 之间通过 cudaMemcpyPeer 或 NCCL 交换梯度/激活值。
+
+四种多GPU编程模式：
+    单主机线程控制多 GPU；  ———— 单CPU线程控制多张显卡
+    多主机线程，每线程控制一个 GPU ———— 指的是 只开 1 个程序（1 个进程），但在这个程序里创建了好几个 CPU 线程。每个线程负责操作 1 张不同的显卡。共享主机内存
+    多进程，每进程控制一个 GPU ———— 指的是 同时启动好几个独立的程序（进程）。每个程序（进程）只认识 1 张显卡，各干各的。不共享主机内存
+    多节点集群；
+
+GPU 之间的“两种通信方式”  （必须分清）
+    P2P Memcpy（内存拷贝），显存之间的大块数据搬运，走 NVLink 或 PCIe，带宽高（几十 GB/s），但有启动开销，用于大数据传输。
+    P2P Access（直接访问），GPU 可以直接读取另一张卡的显存，不需要显式拷贝（类似零拷贝），走 NVLink，延迟极低，适合细粒度访问，用于细粒度通信（比如一个 GPU 频繁读另一个 GPU 的小块数据）
+前提：启用 P2P Access 前，必须调用 cudaDeviceEnablePeerAccess 建立“邻居关系”。否则 GPU 读对方显存会报错
+
+3个加速器：UVA、NCLL、NVLink
+在实际的多卡训练中（如PyTorch DDP），UVA简化了内存管理；PyTorch底层调用NCCL进行梯度同步；而这些NCCL通信，最终通过NVLink高速通道在物理GPU间完成。
+
+
+3.4.1. Multi-Device Context and Execution Management
+多卡编程，要先选设备，分析设备的特点，然后创建上下文：
+    枚举系统中所有可用的 GPU 设备；
+    根据各设备的硬件属性、与 CPU 的亲和性（CPU affinity），以及与其他 GPU 的互连情况（peer connectivity），选择合适的设备；
+    为应用程序将要使用的每个 GPU 创建设备对应的 CUDA 上下文 ———— 确定要用哪几张卡，就要分别为它们初始化运行环境（分配显存管理结构、Stream 队列等）。
+
+
+3.4.2. Multi-Device Peer-to-Peer Transfers and Memory Access       务必理解
+3.4.2.1. Peer-to-Peer Memory Transfers   点对点（peer-to-peer, P2P）传输    ———— P2P (Point-to-Point) 指两个 GPU 之间可以直接通信，不经过 CPU 内存中转。
+这个是通过显示API搬运数据
+当 GPU 之间支持点对点（peer-to-peer, P2P）内存访问时，CUDA 可以在设备之间执行内存拷贝，并利用专用的拷贝引擎（copy engines）以及 NVLink 硬件来最大化传输性能
+    cudaMemcpy，并指定拷贝类型为：DeviceToDevice；数据通过 NVLink 或 PCIe 直连，不经过 CPU 内存。速度较快
+    cudaMemcpy(dst_ptr, src_ptr, size, cudaMemcpyDeviceToDevice)        
+
+若 GPU 间不支持P2P
+    cudaMemcpyPeer(dst_ptr, dst_device, src_ptr, src_device, size) ，数据从 GPU 0 → 系统内存（CPU DRAM） → GPU 1（绕了一圈），速度较慢
+    cudaMemcpyPeerAsync()
+
+注：为了代码健壮性（不管支不支持 P2P 都能跑），直接无脑用 cudaMemcpyPeer。如果检测到 P2P 已启用，驱动会自动走高速路；如果没启用，它会自动回退到绕路模式。
+
+不同GPU有各自的 默认流，如果 cudaMemcpyPeer 发生在默认流上，会堵塞两个GPU的默认流，非堵塞流还是正常运行
+所以要把 P2P拷贝动作 放到非阻塞流上，在多卡操作的时候，会显示激活使用某张卡，cudaSetDevice(0)，在哪个卡上激活并创建了这个流，这个流就属于哪个设备
+cudaStream_t stream;
+cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+cudaMemcpyPeerAsync(p1, 1, p0, 0, size, stream);  // 使用 Async 版本
+
+
+3.4.2.2. Peer-to-Peer Memory Access     点对点内存访问    务必理解
+开启 P2P Access后 GPU 可以直接“伸手”去读/写另一张卡的显存，不需要显式搬运
+只有 P2P Access 需要你手动“开启”；P2P Transfer 不需要“开启”，直接调用 API 就行。
+通过 cudaDeviceEnablePeerAccess()：
+    Kernel 在 GPU 1 上执行时，它可以通过 NVLink/PCIe 直接去 GPU 0 的显存里读取数据，不经过 CPU 内存，也不经过显式拷贝 API。
+
+注：cudaDeviceEnablePeerAccess 会导致“全局开销”
+启用某个设备的 peer 访问，会给该设备上的所有内存分配操作带来额外的运行时开销（multiplicative overhead），并且该开销会随着 peer 设备数量的增加而扩展。
+比如：假设你有 4 张卡，你为了让它们都能互相访问，在每张卡上都调用了 cudaDeviceEnablePeerAccess 开启了对其他 3 张卡的访问权限。
+     之后你在这 4 张卡上每一次调用 cudaMalloc 分配显存时，驱动都必须同步更新其他 3 张卡的页表（Page Table），以确保它们都能看到这块新分配的内存
+     一个简单的分配操作，因为开启了 P2P，变成了需要处理 4 倍页表映射的“重操作”。如果频繁分配/释放显存（比如在循环里反复 cudaMalloc/cudaFree），性能会急剧下降。
+可通过 CUDA 虚拟内存管理(VMM) 按需分配来解决(显式分配支持 peer 访问的内存区域)
+
+
+
+3.4.2.3. Peer-to-Peer Memory Consistency   P2P 内存一致性  务必理解
+当两个 GPU 共享同一块显存时，怎么保证数据不乱套
+GPU 0 在地址 A 写了数据 100 ———— GPU 1 在地址 A 读数据，如果 GPU 0的写操作还没完全刷新到显存，GPU 1可能会读到旧值。
+当 GPU 0 和 GPU 1 共享同一块显存时，所有同步操作（原子操作、栅栏）的作用域必须升级为 thread_scope_system。因为数据要穿过 NVLink 或 PCIe，必须强制刷新全局缓存（L2 和系统内存），否则另一张卡看不到最新值。
+
+跨 GPU 原子操作只适用于 单边写 场景  ———— 即一张卡写，另一张卡只读  ———— 这叫“单生产者-单消费者”或“单边原子操作”
+“跨卡锁”用 GPU 显存做不了，因为硬件不支持；用 CPU 内存能做（慢），适合低频信号；高频大规模同步，永远交给 NCCL。
+
+“跨卡锁” 是一个场景描述，当两个（或多个）GPU 需要独占访问同一块共享内存区域时，用来防止数据冲突的同步机制
+比如：GPU 0 正在写这块内存时，GPU 1 必须等着；GPU 0 写完了，GPU 1 才能读。” ——这个协调机制，就是“跨卡锁”
+
+
+3.4.2.4. Multi-Device Managed Memory    了解
+在支持点对点（P2P）访问的多 GPU 系统上，可以使用统一内存（Managed Memory）
+
+
+4. CUDA Features
+4.1. Unified Memory
+4.1.1. Unified Memory on Devices with Full CUDA Unified Memory Support
+Full UM(完全统一内存) 分为硬件一致性（ATS）和软件一致性（HMM）两类。
+硬件一致性中 CPU/GPU 共享页表，软件一致性中页表独立但驱动负责同步。
+
+HMM 的启用条件：Linux 内核 ≥ 6.1.24/6.2.11/6.3、CUDA 535+、Open Kernel Modules、CC ≥ 7.5
+
+在 Full UM（HMM / ATS）系统上，GPU 可以访问 CPU 的 **任意内存来源**：`malloc`、栈、静态变量、全局变量
+在 WSL（Limited）上，这些**全部不可用**，只能用 `cudaMallocManaged` 或手动拷贝
+
+普通全局变量（未加 `__managed__`）不能在 Kernel 中直接引用，编译器会报错，得把 指针/地址 传进去才行
+
+还能访问 mmap 映射的文件内存。一句话：所有 CPU 能看的内存，Full UM 上的 GPU 都能看。
+
+文件映射内存（mmap）：把磁盘文件直接映射到进程的内存地址空间，让文件内容像内存数组一样被访问。
+
+
+4.1.1.1.2. Inter-Process Communication (IPC) with Unified Memory（多进程共享内存，仅限 Full UM）
+在 Full UM 系统上，多个进程可以通过 Linux 的 `mmap MAP_SHARED` 共享同一块系统内存，并让各自的 GPU 直接访问
+
+
+4.1.1.2.1. Memory Paging and Page Sizes  内存页 和 页大小
+当前所有支持统一内存的系统都使用虚拟地址空间（virtual address space）：这意味着应用程序使用的内存地址是一个虚拟地址，它会被映射到实际存放数据的物理地址。
+目前所有处理器（包括 CPU 和 GPU）也都使用内存分页（paging）机制。由于系统采用虚拟地址空间，因此存在两种类型的内存页：
+    虚拟页（Virtual Pages）  操作系统为每个进程管理的、固定大小的连续虚拟内存块，这些虚拟页可以被映射到物理内存中。
+    物理页（Physical Pages） 处理器的内存管理单元（MMU）所支持的、固定大小的连续物理内存块，虚拟
+通常情况下，虚拟页大小默认与物理页大小一致，但应用程序也可以使用不同的页大小，只要操作系统和硬件支持即可
+
+用于跟踪虚拟页到物理页映射关系的逻辑结构称为页表（page table）
+其中，每一条映射关系（将某个虚拟页映射到物理页）称为页表项（Page Table Entry, PTE）
+所有处理器都会提供专门的缓存，用于加速虚拟地址到物理地址的转换，这种缓存称为：TLB（Translation Lookaside Buffer，快表）
+
+在进行性能优化时，有两个非常重要的因素：
+    虚拟页大小的选择
+    系统是否采用：
+        CPU 和 GPU 共享同一个页表（combined page table）
+        或者 CPU 和 GPU 各自拥有独立页表（separate page tables）
+这两个因素都会对统一内存的性能产生关键影响。
+未来若在 Linux 上使用 Full UM，需考虑页大小对数据迁移的影响。
+
+
+4.1.1.2.1.1. Choosing the Right Page Size  页大小选择
+- 小页（4KB）：碎片少，但 TLB miss 多，随机访问慢。
+- 大页（2MB）：碎片多，但 TLB miss 少，随机访问快。
+- **GPU 的 TLB miss（地址翻译失败） 惩罚远高于 CPU**，因此在 Full UM 调优中，GPU 密集访问的内存应尽量使用大页。
+因为 GPU 有成千上万个线程在跑，一旦发生 TLB miss，大量线程会同时卡住等地址翻译，这个惩罚比 CPU 上严重得多。
+
+
+
+4.1.1.2.1.2. CPU and GPU Page Tables: Hardware Coherency vs. Software Coherency  硬件一致性 和 软件一致性
+**硬件一致性（ATS，Grace Hopper）**：
+- CPU/GPU 共享同一套页表。
+- 数据不迁移，无缺页开销。
+- 同步粒度：**缓存行（64字节）**，适合高频细粒度原子操作(只要写的地址不在同一个 64 字节里，可以并行，不冲突；如果两个处理器修改同一个缓存行里的不同变量，会引发“伪共享（False Sharing）”而性能下降。一致性维护只需交换/失效这 64 字节，开销极小)
+其中：“同步粒度” 就是：当两个处理器（CPU 和 GPU）要共用一块内存时，为了保证数据不错乱，系统一次必须“锁定”和“搬运”的最小数据块是多大。
+这个“块”越小，大家冲突的概率就越低；这个“块”越大，稍微碰一下就要搬一座山，代价就越大
+
+**软件一致性（HMM，Linux 6.x + CUDA 535+）**：
+- CPU/GPU 各有独立页表。
+- 访问异地内存时触发缺页，整页迁移（2MB）。
+- 同步粒度：**页级别**，适合大块低频数据转移 (只要在同一个 2MB 里，必须串行（因为页被锁住了），谁先写谁后写得排队；锁一次要2百万个字节，改一个数字的开销需要同步这2MB字节)
+
+**对页大小的影响**：
+- 硬件一致性：避免 CPU 用 4KB 小页导致 GPU TLB miss 暴增。
+- 软件一致性：大页迁移开销大但 TLB 命中率高；小页迁移快但 TLB miss 多。
+
+总结：
+    硬件一致性（ATS）：不搬数据，只同步状态。如果 CPU 改了变量，它只需要告诉 GPU “这个 64 字节缓存行失效了”，GPU 下次用的时候，通过 NVLink 直接去 CPU 那边读最新的 64 字节。
+
+    软件一致性（HMM）：物理搬移整页数据。如果 GPU 要读 CPU 内存里的一个变量，驱动不是只复制那 8 个字节，而是把变量所在的整个 2MB 物理页，从 CPU 物理内存条搬到 GPU 显存里，并更新 GPU 页表。
+
+
+
+4.1.1.2.2. Direct Unified Memory Access from the Host
+在cudaDevAttrDirectManagedMemAccessFromHost = 1 的系统中
+在所有**硬件一致性系统（hardware-coherent systems）**中，只要设备是通过 NVLink 连接的，这个属性都会被启用：CPU 可以直接访问 GPU 显存，无需迁移
+
+
+4.1.1.2.3. Host Native Atomics
+- `cudaDevAttrHostNativeAtomicSupported = 1` 表示 GPU 可以对 CPU 内存做**硬件原生原子操作**（无需软件模拟）
+其中：“软件模拟”不是 GPU 硬件帮你做原子，而是 GPU 把原子操作拆成“取数、计算、存数”三步，靠驱动强行锁住内存总线来假装是原子的。
+
+- 仅存在于硬件一致性系统（如 Grace Hopper + NVLink）。
+- 在 WSL（Limited）下此属性为 0，不能用映射内存做跨设备原子同步。
+
+**与之前所学的关系**：
+- 映射内存 + 原子操作 = 软件模拟（不安全，不推荐）。
+- 硬件一致性 + Native Atomics = 硬件安全（可用于跨设备同步锁）。
+
+
+4.1.1.2.4. Atomic Accesses and Synchronization Primitives
+cuda::atomic_ref（原子引用）等同步原语在跨设备（CPU+GPU）共享内存上的行为
+
+原子引用：cuda::atomic_ref<T>  ————  atomic_ref 本身不占用额外的内存，它只是把现有内存“提升”为可原子操作的对象
+    // int shared_val = 0;                              // 一块现有的内存（比如 malloc 出来的数组）
+    // 我不想重新定义一个 atomic 对象，我只想在这块内存上临时做原子操作
+    // cuda::atomic_ref<int> ref(shared_val);           // ref 引用 shared_val，不拥有它
+    // ref.fetch_add(1, cuda::memory_order_relaxed);    // 可以原子地给 shared_val 加 1
+
+`cuda::atomic_ref` 可将任意共享内存（含 `mmap`）提升为原子变量，用于 CPU-GPU 跨设备同步，核心价值：零拷贝、零迁移的跨设备信号量。
+
+硬件一致性（ATS/Grace Hopper）：cuda::atomic_ref 在跨设备共享内存上的原子操作是完全安全且高效的。
+软件一致性（HMM/Linux）：GPU 对 CPU 内存的原子操作可能会触发缺页中断，带来额外延迟，并且对文件映射内存（file-backed）做原子操作是不支持的（未定义行为）
+硬件一致性（无缺页）和软件一致性（有缺页）
+
+- 可用 `nvidia-smi -q | grep "Atomic Caps Outbound"` 查看哪些原子操作可避免缺页。
+
+问：在 HMM 软件一致性系统里，为什么 GPU 对 CPU 内存做原子操作比普通读、写更慢，还容易缺页？
+1. 页表隔离：HMM 中 CPU 和 GPU 拥有独立的页表。GPU 的页表默认只映射 GPU 显存，不识别 CPU 物理内存。
+           当 GPU 对 CPU 内存发起原子操作时，GPU MMU 查不到该虚拟地址对应的有效物理页，触发缺页中断。
+
+2. 权限升级：原子操作（atomicAdd）需要硬件级别的“读-改-写”独占锁（总线锁）。这比普通只读访问（LOAD）更严格。
+           驱动在响应缺页时，不仅要建立映射，还必须确保该物理页支持 PCIe 原子事务。如果不支持，驱动必须物理迁移整页到 GPU 显存，在本地完成原子操作。
+
+3. 串行化惩罚：因为是整页迁移（比如 2MB），一旦迁移，该页在迁移完成前被锁定。CPU 和 GPU 上的其他线程若访问该页，都会阻塞排队。这就是“慢”和“高延迟”的根源。
+
+简洁：
+    原因：GPU 页表不认识 CPU 物理页，原子操作需要独占锁，驱动被迫查页表、建映射、甚至搬整页。
+    后果：触发缺页中断（Page Fault）→ 引发物理页迁移（整页 2MB）→ 迁移期间锁定页面 → 其他线程排队等待 → 性能崩盘。
+    并不是所有 GPU 对 CPU 内存的原子操作都会触发 page fault，可以通过命令可以查询支持情况
+
+
+4.1.1.2.6. Overview of Memory Allocators for Unified Memory  内存分配取舍
+Full UM下
+1. malloc / mmap 共享内存（缺页陷阱）
+    在HMM（软件一致性）系统上，GPU 页表不包含 CPU 内存的物理页。GPU 第一次访问 malloc 指针时，会触发缺页中断（page fault），驱动把整个 2MB 物理页从 CPU 内存 物理迁移到 GPU 显存。
+    不适合高频通信，因为缺页中断的代价至少 10~20 微秒，而 GPU 执行一条 load 指令只有纳秒级
+    AI Infra 中的表现：
+        如果你的推理引擎用 mmap 加载模型权重，且系统是 HMM（非 ATS），GPU 第一次访问权重时会卡顿几十毫秒（触发热点缺页）。
+        生产环境如果必须用 malloc 内存，通常会配合 cudaMemAdvise 提示驱动“这块内存未来会被谁访问”，预迁移数据来避免运行期缺页。但远不如 VMM 可控。
+
+2. cudaMallocManaged（原型友好，生产危险）
+    驱动自动管理数据在 CPU/GPU 间的迁移，对开发者隐藏了缺页细节。但迁移粒度通常是 2MB（大页），且迁移时整页锁定，其他线程访问同一页会排队。
+    性能波动大，因为数据在 CPU 和 GPU 之间的物理位置由驱动决定，可能会出现“数据刚被迁到 GPU，CPU 又需要它”——触发反向缺页，再次迁移，形成“震荡（thrashing）”，性能大幅下降
+    AI Infra 场景：
+        cudaMallocManaged 适合原型验证（比如你正在写一个单卡小模型推理，快速验证算法正确性）。但当模型规模变大、多卡并行、延迟敏感时，它会引起不可预测的尾部延迟（tail latency），因此被大厂框架排除在核心路径之外。
+
+3. VMM / 内存池（高性能生产标准）  重要
+    VMM（Virtual Memory Management）让你直接控制 物理页的映射，而不是依赖驱动行为
+    可以：
+        把一块显存永久绑定在特定 GPU 上，不迁移。
+        把页大小固定为 2MB 大页，减少 TLB miss。
+        在多个 GPU 之间建立 零拷贝映射（同一个物理页被多个 GPU 的虚拟地址同时引用）。
+    AI Infra 中的体现：
+        PyTorch 的 CachingAllocator：本质上是一个内存池，它用 cudaMalloc 一次性申请大块显存，然后在内部切小块分配。这避免了频繁调用 cudaMalloc / cudaFree 带来的驱动锁竞争。
+        但 CachingAllocator 的底层如果配合 VMM，可以进一步用 cuMemCreate 创建专用的大页池，减少 TLB miss。
+
+        DeepSpeed 的显存管理：在 ZeRO 优化中，模型权重被切成碎片分散到多卡。VMM 可以把这些碎片映射到同一块物理显存的不同段，实现 无拷贝共享。
+
+        TensorRT 的引擎构建：当多个执行上下文（ExecutionContext）共享同一份权重时，VMM 可以建立 cuMemMap 映射，让多个流共享同一个物理页，节省显存。
+
+    内存池的作用：cudaMalloc 在驱动层有全局锁，多线程同时分配会串行化。内存池一次性申请大块显存（比如 1GB），然后在用户态切分——分配速度从微秒级降到纳秒级，且无锁，对推理引擎的并发吞吐有直接提升。
+
+
+
+4.1.1.2.7. Access Counter Migration   访问计数器迁移（Full UM 高级调优）
+访问计数器（access counters）功能用于跟踪 GPU 对位于其他处理器（例如 CPU 或其他 GPU）上的内存的访问频率。
+它可以指导内存在 CPU 与 GPU 之间，以及多个 GPU 之间的迁移，这一过程称为基于访问计数器的迁移
+
+缺页迁移：被动，等缺页才搬
+访问计数器迁移：主动，硬件统计访问频率，提前搬
+
+**适用场景**：
+- CPU 与 GPU 频繁交换数据（如训练流水线，训练中 CPU 预处理数据，GPU 消费数据）；
+- 多 GPU 共享热点权重页（模型并行，多个 GPU 会频繁读取同一份模型权重，而这些权重可能位于某个 CPU 内存（mmap 大文件）或某张 GPU 显存）；
+- 内存超量分配（部分冷数据放 CPU，热数据自动上 GPU）
+
+
+当未来你面对“显存不够，需要把部分参数放到 CPU 内存但又不想严重掉速”时，你脑子里要弹出这个选项：“用访问计数器引导驱动自动预取，比手动 cudaMemcpy 来回搬高效。”
+
+
+
+4.1.1.2.8. Avoid Frequent Writes to GPU-Resident Memory from the CPU    避免 CPU 频繁写入 GPU 驻留内存（Full UM 调优）
+Full UM 系统下调优“高频小数据交换”的黄金法则
+许多 CPU 架构要求所有内存操作（包括写操作）都必须经过缓存层级。如果系统内存当前驻留在 GPU 上，那么 CPU 对这部分内存的频繁写入会导致缓存未命中，从而需要先将数据从 GPU 传输到 CPU，然后才能把实际的值写入目标内存区域。
+在CPU写 和 GPU读 的时候，可能都会面临数据在对方那里，数据会在CPU和GPU内来回震荡，延迟极高
+如果 CPU 需要频繁写，而 GPU 需要频繁读，最好的办法不是把数据迁来迁去，而是让数据固定放在 CPU 端，GPU 直接远程访问（Zero-Copy）
+两个方法：
+    1. System Allocator，通过 malloc（CPU 系统内存），具体API用的时候再查；数据永远在 CPU 内存，GPU 通过 PCIe/NVLink 远程读取，不迁移，不触发缺页。
+    2. Managed Memory， 通过cudaMallocManaged（统一内存）；默认 Unified Memory 会按需迁移，但加上两个 cudaMemAdvise 后，强制禁止迁移，行为变得和方案一完全一样。
+
+cudaMemAdvise的两个参数：
+cudaMemAdviseSetPreferredLocation：告诉驱动“这块内存最好放在某个位置（CPU/GPU）”
+cudaMemAdviseSetAccessedBy：告诉驱动“这块内存会被某个处理器访问”，让驱动预先建立映射，避免缺页。
+
+**适用场景**：
+- 控制信号、超参数、Producer-Consumer 小数据交换。
+- **不适用于大张量/权重**（远程读取带宽不足）。
+
+既然是固定在CPU上，那为什么不用映射内存 比如 cudaMallocHost
+    不能超量分配：分配多少，物理内存立即占用多少。如果分配 10GB，CPU 内存必须真的有 10GB 空闲；而其他两个方法都是分配的虚拟内存，只有真正访问到的页面才会物理驻留
+    不能再改为迁移，数据永远钉死在 CPU 上，GPU 永远只能远程慢速访问；；去掉cudaMemAdviseSetPreferredLocation，就可以恢复UM的自动迁移行为
+
+
+
+4.1.1.2.9. Exploiting Asynchronous Access to System Memory
+有三种方法把GPU数据传到CPU：
+    1. 显式拷贝（cudaMemcpy）———— GPU 显存 → PCIe → CPU 内存  ———— 大块数据传输（如梯度、激活值回传）
+    2. GPU 直接写入 CPU 内存 占 SM ———— GPU 通过 PCIe 直接写 CPU DRAM（零拷贝）———— 小数据、高频信号（如 flag、step 计数）
+    3. CPU 直接读取 GPU 显存（零拷贝）不占 SM  ———— CPU 通过 PCIe 直接读 GPU 显存 ———— 小数据、低频查询（如 CPU 监控 GPU 状态）。
+根据数据大小和 GPU 负载，选择最优的数据传输路径，而不是永远用 cudaMemcpy
+
+
+
+4.1.4.1. Data Prefetching  数据预取
+cudaMemPrefetchAsync 是 Full UM（HMM/ATS）系统上最直接的数据预取工具，而且是异步的，不会阻塞 CPU 或 GPU 主计算流，且预取操作在指定 stream 中按顺序执行
+它允许你在真正需要数据之前，主动把数据迁到目标处理器附近，从而隐藏迁移延迟。
+
+在 Full UM 系统上，数据默认是“按需迁移”的（首次访问时触发缺页）。但缺页是同步阻塞的——GPU 线程卡住，等 2MB 数据从 CPU 搬过来，才能继续执行。
+
+传统缺页路径：
+CPU 初始化数据 → GPU 启动 Kernel → 触发缺页 → 等待迁移完成 → 开始计算
+
+预取优化路径：
+CPU 初始化数据 → 发起 cudaMemPrefetchAsync（数据后台搬） → 干别的事 → 启动 Kernel → 数据已在本地 → 无缺页，立刻计算
+
+**使用模式**：
+1. CPU 初始化数据。
+2. `cudaMemPrefetchAsync(..., Device)` 预取到 GPU。
+3. 启动 Kernel（数据已在本地）。
+4. `cudaMemPrefetchAsync(..., Host)` 预取回 CPU。
+5. CPU 使用数据。
+
+具体API的参数怎么填，在用的时候再查
+
+
+4.1.4.2. Data Usage Hints 数据使用提示
+当多个处理器同时访问同一数据时，可以使用 cudaMemAdvise 来为区间 [devPtr, devPtr + count) 中的数据提供访问方式的提示。
+
+cudaError_t cudaMemAdvise(const void *devPtr,
+                          size_t count,
+                          enum cudaMemoryAdvise advice,
+                          struct cudaMemLocation location);
+其中 advice：
+    cudaMemAdviseSetReadMostly： 这表示该数据主要用于读取，只有偶尔会被写入。通常来说，这允许在该内存区域中用写带宽换取读带宽的优化策略；
+    cudaMemAdviseSetPreferredLocation： 该提示将数据的**首选位置（preferred location）**设置为指定设备的物理内存，如果 location.type 设置为 cudaMemLocationTypeHost，则表示首选位置是 CPU 内存配置的切换；
+    cudaMemAdviseSetAccessedBy： 在某些系统中，在访问数据之前提前建立内存映射有助于提升性能。
+                                该提示用于告知系统，当 location.type 为 cudaMemLocationTypeDevice 时，数据将会被 location.id 指定的设备频繁访问，从而使系统认为提前创建这些映射是值得的
+    三者可叠加，分别提供不同维度的访问模式信息

@@ -1,6 +1,6 @@
 # 自写 CUDA Kernel 性能报告
 
-> 生成时间：2026-10-26 20:13:53
+> 生成时间：2026-10-27 11:00:43
 
 ## 环境
 
@@ -17,8 +17,7 @@
 
 | kernel | case | 状态 | 我的(ms) | PyTorch(ms) | 加速比 | 峰值显存(MB) | 带宽利用率(%) | Roofline | 备注 |
 |---|---|---|---|---|---|---|---|---|---|
-| paged_attn_int8 | (8,32,2048,128) fp16q/int8k | PASS | 1.262 | 14.08 | 11.16 | 201.4 | 59.01 | memory-bound |  |
-| paged_attn_int8kv | (8,32,2048,128) int8k+int8v | PASS | 1.204 | 18.23 | 15.14 | 138.4 | 41.66 | memory-bound |  |
+| paged_attn_int8kvsplit | (8,32,2048,128) int8kv split4 | PASS | 1.122 | 15.6 | 13.9 | 138.9 | 45.05 | memory-bound |  |
 
 > 状态含义：`PASS` 正确且已测；`WRONG` 结果不对（先修正确性再谈性能）；
 > `SKIP` 文件还没写；`FAIL` 调用/编译出错。
