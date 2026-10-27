@@ -207,13 +207,15 @@ vec4     REG:56 LOCAL:0   47 条访存（41×LDG.E + 6×LDG.E.U16），总指令
 
 | 文件 | 是什么 |
 |---|---|
-| `kernels/w7_paged_attn_split.cu` | **当前最优**（split-L，1.2483 ms） |
+| `kernels/w7_paged_attn_split.cu` | **fp16 最优**（split-L，1.2483 ms） |
 | `kernels/w7_paged_attn.cu` | 单链 2 路展开（1.5084 ms） |
 | `kernels/w7_paged_attn_单遍online.cu.bak` | 单遍 online（1.8897 ms） |
 | `kernels/w7_paged_attn_参考版.cu.bak` | 参考实现（1.9763 ms） |
-| `kernels/w8_int8_attn.cu` | INT8 K（台阶1，1.1377 ms） |
+| `kernels/w8_paged_attn_int8.cu` | **全局最快**：INT8 K（台阶1，1.0419 ms，但 K 有量化误差） |
+| `kernels/w8_paged_attn_int8kv.cu` | INT8 K+V 单字节（台阶2 反例，1.2032 ms） |
+| `kernels/w8_paged_attn_int8kv_vec4.cu` | INT8 K+V + int8×4（台阶3 反例，1.5503 ms） |
 | `kernels/w8_INT8台阶1-实现契约.md` | 台阶1 的契约与 19 处改动清单 |
-| `kernels/bench_kernels.py` | REGISTRY 里 `paged_attn` / `paged_attn_split` / `paged_attn_int8` 三条 |
+| `kernels/bench_kernels.py` | REGISTRY 里 `paged_attn` / `paged_attn_split` / `paged_attn_int8` / `paged_attn_int8kv` / `paged_attn_vec4` 五条 |
 
 ## 9. 面试能讲的三点
 
