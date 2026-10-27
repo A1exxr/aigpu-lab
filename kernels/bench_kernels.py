@@ -244,6 +244,41 @@ def ref_paged_attn_int8(q, k_q, k_scale, v_cache, block_table, context_lens):
 
 REGISTRY: list[KernelSpec] = [
     KernelSpec(
+        name="paged_attn_int8kvsplit",
+        cuda_file="kernels/w8_paged_attn_int8kvsplit.cu",
+        cpp_signature=(
+            "torch::Tensor paged_attn_int8kvsplit("
+            "torch::Tensor q, torch::Tensor k_q, torch::Tensor k_scale, "
+            "torch::Tensor v_q, torch::Tensor v_scale, "
+            "torch::Tensor block_table, torch::Tensor context_lens);"
+        ),
+        functions=["paged_attn_int8kvsplit"],
+        note="W8 台阶4：KV 全 int8（单字节 load）+ split-L(NSPLIT=4, grid 32->128)。"
+             "只动并行度，流量 130.1 MiB + partial 往返 2 MiB",
+        cases=[
+            Case(
+                label="(8,32,2048,128) int8kv split4",
+                shape=(8, 32, 2048, 128),
+                dtype="fp16",
+                make_inputs=_make_paged_int8kv_inputs,
+                cuda_call=lambda mod, inp: mod.paged_attn_int8kvsplit(
+                    inp["q"], inp["k_q"], inp["k_scale"], inp["v_q"],
+                    inp["v_scale"], inp["block_table"], inp["context_lens"]),
+                ref_call=lambda inp: ref_paged_attn_int8kv(
+                    inp["q"], inp["k_q"], inp["k_scale"], inp["v_q"],
+                    inp["v_scale"], inp["block_table"], inp["context_lens"]),
+                nbytes=lambda s, d: (
+                    2 * s[0] * s[1] * s[3] * 2
+                    + s[0] * s[1] * s[2] * s[3] * 1
+                    + s[0] * s[1] * s[2] * s[3] * 1
+                    + 2 * s[0] * s[1] * s[2] * 2
+                    + 2 * (4 * s[0] * s[1] * s[3] * 4 + 2 * 4 * s[0] * s[1] * 4)
+                ),
+                flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[3],
+            ),
+        ],
+    ),
+    KernelSpec(
         name="rmsnorm",
         cuda_file="kernels/w2_rmsnorm.cu",
         cpp_signature=(

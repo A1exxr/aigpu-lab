@@ -15,8 +15,8 @@
 __global__ void paged_attn_int8kv_kernel(const half*   __restrict__ q,            // [B,H,D]
                                          const int8_t* __restrict__ k_q,          // [NB,BS,H,D] 量化后的 K
                                          const half*   __restrict__ k_scale,      // [NB,BS,H]   每个 (token,head) 一个 scale
-                                         const int8_t* __restrict__ v_q,          // [NB,BS,H,D] 量化后的 V（新增）
-                                         const half*   __restrict__ v_scale,      // [NB,BS,H]   V 的 scale（新增）
+                                         const int8_t* __restrict__ v_q,          // [NB,BS,H,D] 量化后的 V
+                                         const half*   __restrict__ v_scale,      // [NB,BS,H]   V 的 scal 
                                          const int*    __restrict__ block_table,  // [B,MAXB]
                                          const int*    __restrict__ context_lens, // [B]
                                          half*         __restrict__ out,          // [B,H,D]

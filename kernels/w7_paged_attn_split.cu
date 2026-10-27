@@ -155,7 +155,7 @@ __global__ void paged_attn_split_kernel(const half* __restrict__ q,
         // 每个split是一个块完整的[B,H,D] ———— partial[i] 就是“第 i 个 split 的完整结果”
         // 这里完整的(B, H, D)是指每个 split 扫的是 L 的一段，所以它算出的 acc_i 是“部分结果”
         // 但这个部分结果覆盖的 (b,h,d) 范围是完整的，缺的只是 L 方向上的另外 3/4
-        partial_acc[split * B * H * D + b * H * D + h * D + d] = acc[k];
+        partial_acc[split * B * H * D + b * H * D + h * D + d] = acc[k];            // (lane, k) 组合唯一确定一个 d
     }
 
 }

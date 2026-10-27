@@ -2301,7 +2301,7 @@ for (int offset = num_warps / 2; offset > 0; offset >>= 1) { ... }
 
 ### 清单新增（下次从这里抽）
 
-- [ ] **E-75**（新增，🔴）默写 paged 行地址：`block_table[b*MAXB + t/BS]` / `t % BS` / `((size_t)(phys*BS+off)*H+h)*D`
+- [x] **E-75**（新增，🔴）默写 paged 行地址：`block_table[b*MAXB + t/BS]` / `t % BS` / `((size_t)(phys*BS+off)*H+h)*D`
 - [ ] **E-76**（新增，🔴）**收尾块为什么用 L=2048 测不出来**？正确答案：偶数 L 循环正好配对完，`t` 停在 L，`if (t < L)` 恒假 → 那 6 行是死代码。**以后任何"只在某些分支上执行"的代码，必须专门构造触发它的输入。**
 
 **根因（写给以后看）**：你说"我写完了"时是**照着我给的片段替换**，没有重新推导一遍。所以脑子里存的还是旧的那一版——**"照抄改对" ≠ "会写"**。下次改完，立刻关掉参考重默一遍，这是唯一能验证的方式。
@@ -2329,5 +2329,83 @@ for (int offset = num_warps / 2; offset > 0; offset >>= 1) { ... }
 
 **根因：这三次都是"局部优化"压倒了"全局约束"——先看 grid/占用率，再谈向量化。**
 
+### 2026-10-26　第 8 次自测（6 题骨架默写）
+
+**判分**：① ✅ / ② ✅ / ③ 🟡 / ④ ❌ / ⑤ 未答 / ⑥ 🟡
+
+| # | 题 | 结果 |
+|---|---|---|
+| ① | paged 行地址（`k_q` 元素下标，四层乘法） | ✅ **第一次答对**（前两次都错，E-75 可以降级） |
+| ② | warp 归约 + 广播 | ✅ 三个空全对 |
+| ③ | online softmax 一轮吃两个 token | 🟡 写回了**单 token 版**（`vrow` / `p` / 无 `sv`） |
+| ④ | split-L 切分 + 合并 | ❌ `chunk` 没上取整、`split` 用了 `L % NSPLIT`、合并权重没写 |
+| ⑤ | int8×4 拆字节 | 未答（诚实说"还没细看"，正确） |
+| ⑥ | vec4 为什么慢 | 🟡 方向对，但说成"没变多"，实际是**变少**（12 → 4） |
+
+**① 的答案（他自己写对了）**
+
+```cpp
+int  phys = block_table[b * MAXB + t / BS];
+int  off  = t % BS;
+size_t row = (size_t)(phys * BS * H * D + off * H * D + h * D);   // == (phys*BS+off)*H*D + h*D
+```
+
+唯一笔误：`block_table(...)` 里的圆括号（C++ 数组下标要 `[]`）。
+
+**③ 正确答案（双 token）**
+
+```cpp
+float m_new = fmaxf(m, fmaxf(s0, s1));
+float alpha = __expf(m - m_new);
+float p0    = __expf(s0 - m_new);
+float p1    = __expf(s1 - m_new);
+denom = denom * alpha + p0 + p1;
+float pc0 = p0 * sv0, pc1 = p1 * sv1;
+for (int k = 0; k < 4; ++k)
+    acc[k] = acc[k] * alpha + pc0 * (float)vrow0[d0] + pc1 * (float)vrow1[d1];
+```
+
+**④ 正确答案（切分 + 合并）**
+
+```cpp
+int chunk  = (L + NSPLIT - 1) / NSPLIT;      // 上取整，否则最后一段被截掉
+int split  = gwarp % NSPLIT;                  // 不是 L % NSPLIT
+int t_begin = split * chunk;
+int t_end   = min(L, t_begin + chunk);
+
+float M = -FLT_MAX;
+for (int i = 0; i < NSPLIT; ++i) M = fmaxf(M, m_arr[i]);
+
+float denom = 0.f;
+float acc[4] = {0.f, 0.f, 0.f, 0.f};
+for (int i = 0; i < NSPLIT; ++i) {
+    float w = __expf(m_arr[i] - M);
+    denom  += den_arr[i] * w;
+    for (int k = 0; k < 4; ++k)
+        acc[k] += partial_acc[((i*B + b)*H + h)*D + 4*lane + k] * w;
+}
+```
+
+**⑤ 正确答案（int8×4 拆字节）**
+
+```cpp
+int k4 = *reinterpret_cast<const int*>(krow + 4 * lane);
+const __half2* q2 = reinterpret_cast<const __half2*>(qrow + 4 * lane);
+float2 qa = __half22float2(q2[0]);
+float2 qb = __half22float2(q2[1]);
+s += qa.x * (int8_t)(k4)       + qa.y * (int8_t)(k4 >> 8)
+   + qb.x * (int8_t)(k4 >> 16) + qb.y * (int8_t)(k4 >> 24);
+```
+
+### 清单新增（下次从这里抽）
+
+- [ ] **E-80**（新增，🔴）③ 双 token online softmax 默写又写回单 token 版。**这是 10-25 同一根因第 2 次**（照抄旧版，没重新推导）。判据：写完立刻数一遍"这一轮里有几个 p、几个 m_new、alpha 用几次"。
+- [ ] **E-81**（新增，🔴）④ `split` 取成了 `L % NSPLIT`（"余数"与"第几段"混淆）；`chunk` 没上取整（L 不是 NSPLIT 的整数倍就丢尾部 token）。
+- [x] **E-82**（新增，🟡）⑥ 措辞："在飞请求没变多" → 应是"**变少了**：每 warp 从 12 条独立 load 降到 4 条"。
+- [x] **E-75** 降级 🔴 → 🟡（① 已能一次默写对）。
+
 *最后更新：2026-10-26*
 
+- [ ] **E-83**（新增，🔴）`denom` 能不能乘 V 的 `sv`？说出 `p*sv` 只出现在哪一行。
+- [ ] **E-84**（新增，🔴）`130.1 MiB` 在 `1.2032 ms` 内：多少 GB/s？占实测 221.4 的百分之多少？
+- [ ] **E-85**（新增，🟡）`L=2047, NSPLIT=4`：`chunk` 多少？`split=3` 处理几个 token？`chunk` 下取整会漏掉哪些 token？
