@@ -333,7 +333,13 @@ ncu 用法与"怎么判瓶颈"记在 [`docs/01-概念/03-ncu速查.md`](docs/01-
 │   ├── 02-实验/                 GEMM 台阶 4 分析 / PagedAttention 八版记录 / launch 与并发
 │   ├── 03-错题/                 CUDA 错题本（77 条）/ cuda-guide 自测清单
 │   └── 04-复习/                 项目总账（数字口径 + 面试清单）
-└── results/                   实测报告、原始数据、图表、ncu 剖面摘录
+└── results/                   全部实测数据（只有一个 results/，不分散）
+    ├── kernels.md             最近一次 bench 的逐算子结果（每次跑覆盖）
+    ├── paged_attn_versions.md  PagedAttention 八个版本的固定记录（手写维护）
+    ├── baseline.md            Roofline 基线与理论峰值
+    ├── attention_scaling.md   序列长度→时延/显存的缩放实验
+    ├── fig_*.png              Roofline / attention 图
+    └── ncu/                   Nsight Compute 剖面摘录（reduce / softmax / fused）
 ```
 
 ---
