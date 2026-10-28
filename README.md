@@ -113,7 +113,7 @@ PagedAttention decode 是纯带宽题（AI = 32 FLOPs/Byte，拐点 240），但
 
 ```
 2 路展开（每迭代 4 个独立 load）  1.5084 ms   178.1 GB/s   65.5% 标称
-split-L（L 切 4 段 + merge）      1.2483 ms   215.1 GB/s   97.2% 实测量
+split-L（L 切 4 段 + merge）      1.2483 ms   216.0 GB/s   97.6% 实测量
 ```
 
 原因不在 kernel 内，在**外面**：`B·H = 256` 个 warp = 32 个 block，而卡有 24 个 SM ——
@@ -195,7 +195,7 @@ KV 按 16 token 一块散落在 1024 个物理块里，靠 `block_table` 映射�
 | 1 naive | 两遍扫描：先求 max/分母，再算加权和 | 384 MiB | 2.3644 ms | 170.3 GB/s | 76.9% |
 | 2 online softmax | `m/denom/acc` 增量更新，KV 只读一遍 | 256 MiB | 1.8897 ms | 142.1 GB/s | 64.2% |
 | 3 单链 2 路展开 | 一次吃 2 个 token，4 个独立 load 交错 | 256 MiB | 1.5084 ms | 178.1 GB/s | 80.4% |
-| 4 split-L | L 切 4 段并行 + merge kernel | 256 MiB | 1.2483 ms | 215.1 GB/s | **97.2%** |
+| 4 split-L | L 切 4 段并行 + merge kernel | 257 MiB | 1.2483 ms | 216.0 GB/s | **97.6%** |
 | 5 **K 换 int8** | 只把 KV cache 里的 K 换成 int8（V/Q/out 仍 fp16），scale 提到点积累加之后 | 193 MiB | **1.0419 ms** | **194.4 GB/s** | **87.8%** |
 
 三步各自解决不同瓶颈，数据可以互相印证：
@@ -204,7 +204,7 @@ KV 按 16 token 一块散落在 1024 个物理块里，靠 `block_table` 映射�
 - **单遍 → 2 路展开**：单遍时每迭代只有 2 个 load 在飞，延迟藏不住；展开到 4 个后 1.25×。
 - **→ split-L**：ILP 已到寄存器上限，但 warp 总数只有 32 个 block，SM 吃不饱；切段后 grid = 128，1.21×。
 
-**fp16 路线的终点**：`215.1 ÷ 221.4 = 97.2%`，只剩 2.5%。bench 报 79.1% 是拿 272 标称做分母，而这张卡从未到过 272。
+**fp16 路线的终点**：`216.0 ÷ 221.4 = 97.6%`，只剩 2.4%。bench 报 79.1% 是拿 272 标称做分母，而这张卡从未到过 272。
 
 **再快只能少搬字节**，于是做了 INT8：K 换成 int8（`scale = max|x|/127`，每 (token, head) 一个 fp16 scale）。
 
@@ -319,19 +319,20 @@ ncu 用法与"怎么判瓶颈"记在 [`docs/01-概念/03-ncu速查.md`](docs/01-
 │   ├── w4_attn_naive.cu         naive attention（QKᵀ / softmax / PV 三个 kernel）
 │   ├── w5_flash_attn.py         FlashAttention（Triton，online softmax；D≤64、无 causal）
 │   ├── w6_gemm.cu               GEMM 四级台阶（naive / tiling / 4×4 寄存器分块 / wmma Tensor Core）
-│   ├── w7_paged_attn_split.cu   PagedAttention decode split-L（1.2483 ms，97.2% 实测带宽）
+│   ├── w7_paged_attn_split.cu   PagedAttention decode split-L（1.2483 ms，97.6% 实测带宽）
 │   ├── w7_paged_attn.cu         单链 2 路展开版（1.5084 ms）
 │   ├── w8_paged_attn_int8.cu    INT8 只量化 K（1.0419 ms，本项目最优）
 │   ├── w8_paged_attn_int8kv.cu  INT8 量化 K+V（反例，1.2032 ms）
 │   ├── w8_paged_attn_int8kv_vec4.cu  再加 vec4 加载（反例，1.5503 ms）
 │   ├── w8_paged_attn_int8kvsplit.cu  再加 split-L（反例，1.1223 ms）
-│   ├── w7_paged_attn_实验过程.md   PagedAttention 全部八版的实验记录（台阶表 / 机制 / 为什么停）
-│   ├── GEMM台阶4-不达标分析与优化.md   台阶4 的定位过程与 tile 选择推导
-│   ├── CUDA错题本.md            77 条真实错误与修正（E-01~E-72 + K-01~K-05，按主题分组）
-│   ├── ncu速查.md               ncu 命令、指标含义、存储分级、怎么判瓶颈
-│   ├── attention入门-从公式到显存流量.md   attention 的流量账与 FlashAttention 动机
-│   └── flash-attention详解.md      FlashAttention 原理、online softmax 推导、流量与 AI 逐项算账
-├── docs/                      开发说明、README 模板、博客草稿
+│   ├── README.md               课程顺序、验收标准、五问
+│   └── 骨架默写卡.md            12 个可默写的 kernel 骨架（6 天轮换）
+├── docs/                       概念、实验记录、错题本、复习材料
+│   ├── 00-索引.md                全部文档的地图
+│   ├── 01-概念/                 如何写 kernel / CUDA 速查 / ncu 速查 / attention 入门 / FlashAttention / 流与图
+│   ├── 02-实验/                 GEMM 台阶 4 分析 / PagedAttention 八版记录 / launch 与并发
+│   ├── 03-错题/                 CUDA 错题本（77 条）/ cuda-guide 自测清单
+│   └── 04-复习/                 项目总账（数字口径 + 面试清单）
 └── results/                   实测报告、原始数据、图表、ncu 剖面摘录
 ```
 
@@ -381,7 +382,7 @@ ncu --clock-control none --set full -c 1 \
   这条负结果比正结果更能说明"tile 大小要与占用率一起算"。未做：128×128 tile + `cp.async` 双缓冲流水。
 - **bench 与 ncu 两把尺子差 40%，原因未定论**（已排除降频/入队/分配器），见上方口径说明。
 - **PagedAttention decode 最优是 INT8 只量化 K**（1.0419 ms，194.4 GB/s = 87.8% 实测带宽）；
-  fp16 版是 1.2483 ms / 97.2%。量化把流量从 256 降到 193 MiB，但窄流也把利用率拉低了 10 个点。
+  fp16 版是 1.2483 ms / 97.6%。量化把流量从 256 降到 193 MiB，但窄流也把利用率拉低了 10 个点。
   **KV 全量化的四条分支全是反例**（1.12–1.55 ms），原因与验证过程写在实验记录里。
 - **PagedAttention 的 `L < BS`（不足一块）分支尚未验证**，只测过 `L=2048` 与 `L=2049`。
 - **PyTorch 基线不是 SDPA**：decode 阶段没有对应的 torch 算子，参考实现是显式循环（8.36 ms），

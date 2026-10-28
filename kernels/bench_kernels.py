@@ -639,9 +639,12 @@ REGISTRY: list[KernelSpec] = [
                 ref_call=lambda inp: ref_paged_attn(
                     inp["q"], inp["k_cache"], inp["v_cache"],
                     inp["block_table"], inp["context_lens"]),
+                # 主 kernel：q + out + K/V 各一遍；
+                # merge kernel：4 段 partial_acc（[4,B,H,D] fp32）写一次、读一次 = 1 MiB
                 nbytes=lambda s, d: (
                     (2 * s[0] * s[1] * s[3] + 2 * s[0] * s[1] * s[2] * s[3])
                     * workloads.elem_bytes(d)
+                    + 2 * 4 * s[0] * s[1] * s[3] * 4
                 ),
                 flops=lambda s, d: 4.0 * s[0] * s[1] * s[2] * s[3],
             ),
