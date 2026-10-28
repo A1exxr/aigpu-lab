@@ -45,7 +45,7 @@ kernels/
   bench_kernels.py      # 复用 gpulab，测你自己的 kernel
 ```
 
-## 现状（2026-10-27）
+## 现状（2026-10-28）
 
 | kernel | 状态 | 关键数字 |
 |---|---|---|
@@ -57,7 +57,7 @@ kernels/
 | `w4_attn_naive.cu` | 完成 | 46.87 → **15.53 ms**（warp-per-j + PV 四路切分 + QK ILP-4） |
 | `w5_flash_attn.py` | 完成 | **0.474 ms**，达 PyTorch SDPA 的 91%，naive 的 1/32.8 |
 | `w6_gemm.cu` | **台阶 1–4 完成** | 2.42 → 1.78 → 0.657 → **0.2836 ms**（Tensor Core），超 PyTorch fp32 基线 1.13×；64×64 tile 反例更慢（0.3758） |
-| `w7_paged_attn_split.cu` | 完成（已封板） | 2.3644 → 1.8897 → 1.5084 → **1.2483 ms**，215.1 GB/s = **97.2% 实测天花板** |
+| `w7_paged_attn_split.cu` | 完成（已封板） | 2.3644 → 1.8897 → 1.5084 → **1.2483 ms**，216.0 GB/s = **97.6% 实测天花板** |
 | `w8_paged_attn_int8.cu` | 完成（最优） | 只量化 K：**1.0419 ms**，194.4 GB/s = 87.8% 实测天花板 |
 | `w8_paged_attn_int8kv*.cu` | 完成（三个反例） | KV 全量化 1.2032 / 再加 vec4 1.5503 / 再加 split-L 1.1223，均不如只量化 K |
 

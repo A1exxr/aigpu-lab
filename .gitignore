@@ -35,3 +35,7 @@ kernels/自测-*.md
 kernels/w7_paged_attn2.cu
 kernels/results/
 notes/cuda-guide-读书笔记.txt
+
+# 编译产物（实验程序）
+exp_sched
+*.out
