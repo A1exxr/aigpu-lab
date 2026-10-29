@@ -342,11 +342,18 @@ int M, int K, int N){
 
 
 
-// gemm nt变体   C=A×B^T ———— cuBLAS 的 NN/NT/TN/TT 四种布局         
+// gemm NT变体   C=A×B^T ———— cuBLAS 的 NN/NT/TN/TT 四种布局      ———— Y = X·Wᵀ 一般在前向里，自变量乘权重 
 /*
     NT 布局：B 存的是 [N][K]，即 Bs[n][k] 在内存里地址 = n*32 + k
     wmma 要的 matrix_b 是 "K×N 的列主序"：逻辑 (k,n) 必须落在 k + n*ldm
     所以 ldm = 32，指针 = &Bs[n_base][k_base] = &Bs[warp_n*16][kk] 
+
+
+    如果直接用 A 的行与 B 的行做乘加，是对的，不过这是CUDA Core算法，不是Tensor Core的
+    Tensor Core中，wmma::mma_sync 是一条硬件指令，它不做“点积”，它做的是：D(16,16) = A(16,16) * B(16,16)
+    它要求 B 是一个逻辑 K×N 的矩阵 fragment，不能“按行做点积”
+    B 在内存里是 [N,K]，但 Tensor Core 要 [K,N]，  因为A 是[M,K]，通过K维归约
+    [N,K]的行主序 在 物理上等价于 [K,N]的列主序，所以只需要在 load_matrix_sync 时 按列主序读这个 [N,K]，读出来就是 [K,N]
 */
 __global__ void gemm_nt_kernel(const half* __restrict__ A,
                                 const half* __restrict__ B,
@@ -369,6 +376,27 @@ __global__ void gemm_nt_kernel(const half* __restrict__ A,
 
     __shared__ float Cf[32][32];      
 
+    /*
+        行主序存 + fragment 行主序 → 物理行就是逻辑行
+        行主序存 + fragment 列主序 → 物理行读成逻辑转置
+        转置后就能乘，刚好满足 Tensor Core
+
+        列主序存 + fragment 列主序 → 物理列对应逻辑列
+        列主序存 + fragment 行主序 → 读出来也是逻辑转置
+    
+        fragment 的布局和物理存储的布局一致 → 逻辑 = 物理；不一致 → 逻辑 = 物理的转置
+
+        只需要明白这个就行：
+            A、B 都是行主序，NT 只需对 B 逻辑转置
+            读到共享内存里才涉及 合并访存
+            在共享内存里面读数据 shared→fragment 不涉及合并访存，只有 bank conflict 
+
+            fragment 的 row_major / col_major 申明，本质上就是告诉编译器：逻辑矩阵的 (i,j) 元素，去物理内存的哪个地址取。
+            申明和物理存储一致 → 读出来就是物理矩阵本身，不转置；
+            申明和物理存储相反 → 读出来就是物理矩阵的转置。
+
+
+    */
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;   // NT：Bs 存的是 [n][k]，对 B 而言是列主序
     wmma::fragment<wmma::accumulator, 16 ,16, 16, float> c_frag;
@@ -383,15 +411,18 @@ __global__ void gemm_nt_kernel(const half* __restrict__ A,
             // 8轮迭代，每轮128个线程，搬128个数据，4 个 warp ———— 每个 warp 负责一整行，r 固定，c 从 0 到 31 连续   
             int r = i / 32;         // 0 1 2 3 ... 31    i是从0到1024
             int c = i % 32;         // 0 1 2 3 ... 31
-            As[r][c] = A[(bm * 32 + r) * K + (k0 + c)];
+            As[r][c] = A[(bm * 32 + r) * K + (k0 + c)];     
+            // 这里B的行跨度也是K，因为B的形状是[N,K]  不是[K,N]
             Bs[r][c] = B[(bn * 32 + r) * K + (k0 + c)];   // NT：r 走 N，c 走 K（B 存成 [N][K] 行主序）
         }
         __syncthreads();
 
         for (int kk = 0; kk < 32; kk += 16) 
         {             
-            wmma::load_matrix_sync(a_frag, &As[warp_m * 16][kk], 32);
-            wmma::load_matrix_sync(b_frag, &Bs[warp_n * 16][kk], 32);
+            // row_major  逻辑元素 (i,j) 的地址：ptr + i * ldm + j   让逻辑和物理行主序对齐
+            // col_major                        ptr + j * ldm + i   让物理行主序读出来变成逻辑转置
+            wmma::load_matrix_sync(a_frag, &As[warp_m * 16][kk], 32);       // load只看fragment的布局和ldm，A是row_major，32是行跨度
+            wmma::load_matrix_sync(b_frag, &Bs[warp_n * 16][kk], 32);       // B是col_major，32是列跨度
             wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
             }
 
@@ -411,8 +442,112 @@ __global__ void gemm_nt_kernel(const half* __restrict__ A,
 }   
 
 
+// 这个是 TN 变体， 一般在反向里（每个 Linear 都有）    ———— dW = Xᵀ·dY
+// C = A^T @ B   A[K,M]  B[K,N]  C[M,N]
+/*
+    就是计算：C[M,N] = Aop[M,K] × B[K,N]
+    Aop就是参与这次矩阵乘法的 A
+    op 是 operand（操作数）的缩写，不是“操作/算子”；
+    写 Aop 是为了和“原始存储的 A”区分：Aop 是经过布局/转置处理后的逻辑 A
 
+    A 在显存里是 [K, M]        ← 字母 T：被转置存储
+    B 在显存里是 [K, N]        ← 字母 N：正常存储
 
+    GEMM 要的是 Aop[M,K] × B[K,N]
+    Aop = (显存里那个 A)ᵀ = [K,M]ᵀ = [M,K]   ✓  这才能乘
+*/ 
+
+__global__ void gemm_tn_kernel(const half* __restrict__ A,
+                                const half* __restrict__ B,
+                                half* __restrict__ C,
+                                int M, int K, int N)
+{
+    int tx = threadIdx.x;               // 0..31   tile 内的列偏移
+    int ty = threadIdx.y;               // 0..3    = warp 编号
+    int btid = ty * 32 + tx;            // 0..127  线性线程号（搬数据时用）   block: 32 * 4
+
+    // 在 C 的32*32tile里的布局
+    int warp_m = ty / 2;                // 0 1
+    int warp_n = ty % 2;                // 0 1
+    int bm = blockIdx.y;                // C tile 的行号
+    int bn = blockIdx.x;                // C tile 的列号
+
+    __shared__ half As[32][32];
+    __shared__ half Bs[32][32];
+    
+
+    __shared__ float Cf[32][32];      
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;   
+    wmma::fragment<wmma::accumulator, 16 ,16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);     
+
+    // 外层K循环
+    for(int k0 = 0; k0 < K; k0 += 32)
+    {
+        // 128线程装1024个元素，1个线程装8个元素
+        for(int i = btid; i < 1024; i += 128)
+        {
+            // 8轮迭代，每轮128个线程，搬128个数据，4 个 warp ———— 每个 warp 负责一整行，r 固定，c 从 0 到 31 连续   
+            int r = i / 32;         // 0 1 2 3 ... 31    i是从0到1024
+            int c = i % 32;         // 0 1 2 3 ... 31
+            As[r][c] = A[(k0 + r) * M + (bm * 32 + c)];     // r 走 K 方向
+            Bs[r][c] = B[(k0 + r) * N + (bn * 32 + c)];     // c 走 M 或 N 方向
+        }
+        __syncthreads();
+
+        for (int kk = 0; kk < 32; kk += 16) 
+        {             
+            // row_major  逻辑元素 (i,j) 的地址：ptr + i * ldm + j   让逻辑和物理行主序对齐
+            // col_major                        ptr + j * ldm + i   让物理行主序读出来变成逻辑转置
+            wmma::load_matrix_sync(a_frag, &As[kk][warp_m * 16], 32);       // a_frag是col_major 要逻辑 M * K
+            wmma::load_matrix_sync(b_frag, &Bs[kk][warp_n * 16], 32);       // b_frag 要逻辑 K * N
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+
+        __syncthreads();   // 下一轮要覆盖 As/Bs
+    }
+
+    // 写回累加器共享内存
+    wmma::store_matrix_sync(&Cf[warp_m * 16][warp_n * 16], c_frag, 32, wmma::mem_row_major);
+    __syncthreads();
+
+    for(int i = btid; i < 1024; i += 128)
+    {
+        int r = i / 32;
+        int c = i % 32;
+        C[(bm * 32 + r) * N + bn * 32 + c] = __float2half(Cf[r][c]);
+    }
+}   
+/*
+    总结：
+        1. 比较“物理维度顺序”和“逻辑维度顺序”
+    	    物理第一维	物理第二维	逻辑第一维	逻辑第二维	一致？
+        A	    K	       M	     M	        K	    反了
+        B	    K	       N	     K	        N	    一致
+
+        2. 根据“一致/相反”选布局  (行主序存储的)
+        物理 vs 逻辑	    fragment 布局
+            一致	        row_major
+            相反	        col_major
+        
+        3. load_matrix_sync 的起始地址按“物理维度顺序”写
+            a_frag 要取逻辑 [M, K] 的 16×16 子块
+                M 方向第 warp_m * 16 块
+                K 方向第 kk 块
+                但物理 As 是 [K][M]，第一维是 K，第二维是 M，所以：
+                    &As[kk][warp_m * 16]
+                         ↑    ↑
+                         K    M
+                不是 &As[warp_m*16][kk]，因为那样第一维写的是 M，但物理第一维是 K，错位
+            
+            b_frag 要取逻辑 [K, N] 的 16×16 子块
+                K 方向第 kk 块
+                N 方向第 warp_n * 16 块
+                物理 Bs 是 [K][N]，第一维 K、第二维 N，所以
+                    &Bs[kk][warp_n * 16]
+*/
 
 
 
@@ -517,6 +652,23 @@ torch::Tensor gemm_nt(torch::Tensor A, torch::Tensor B) {
     dim3 grid((N + 31) / 32, (M + 31) / 32);
 
     gemm_nt_kernel<<<grid, block>>>(
+        reinterpret_cast<const half*>(A.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(B.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(C.data_ptr<at::Half>()),
+        M, K, N);
+    return C;
+}
+
+
+torch::Tensor gemm_tn(torch::Tensor A, torch::Tensor B) {
+    int K = A.size(0), M = A.size(1);        // ← A 是 [K, M]
+    int N = B.size(1);                       // ← B 是 [K, N]（和 gemm_nt 不同！）
+    auto C = torch::empty({M, N}, A.options());
+
+    dim3 block(32, 4);
+    dim3 grid((N + 31) / 32, (M + 31) / 32);
+
+    gemm_tn_kernel<<<grid, block>>>(
         reinterpret_cast<const half*>(A.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(B.data_ptr<at::Half>()),
         reinterpret_cast<half*>(C.data_ptr<at::Half>()),
