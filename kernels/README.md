@@ -51,7 +51,7 @@ kernels/
 |---|---|---|
 | `w2_reduce.cu` | 完成 | 0.1137 ms / 54.3% 带宽，ncu DRAM 87.3%（已贴墙） |
 | `w2_softmax.cu` | 完成 | 0.2160 ms / 57.1%，屏障 20 → 4 |
-| `w2_gelu.cu` | 完成 | 0.1516 ms / **81.4%**，`__half2` 向量化，追平 PyTorch |
+| `w2_gelu.cu` | 完成 | 0.1516 ms / **81.4%**，`__half2` 向量化，追平 PyTorch；block 256 与 512 等价（0.1505 / 0.1516 ms，±1%），降到 128 掉 15%（189.4 GB/s / 69.6%） |
 | `w2_rmsnorm.cu` | **跳过** | 知识点已被 w3 融合版覆盖 |
 | `w3_fused_rmsnorm_residual.cu` | 完成 | 融合版 199.9 µs / ncu DRAM 92.8%，比两 kernel 版快 1.95× |
 | `w4_attn_naive.cu` | 完成 | 46.87 → **15.53 ms**（warp-per-j + PV 四路切分 + QK ILP-4） |
