@@ -168,12 +168,13 @@ __global__ void gemm_reg_kernel(const half* __restrict__ A,
 // 台阶4  ———— 一整个 warp（32 个线程）协作算一块 16×16 —————— 采用WMMA（张量核心），1 个 warp 各管一个 16×16，Tensor Core 一次算完 16×16×16 = 4096 次乘加
 // 一个block 有 4 个warp， 处理32*32的C块
 __global__ void gemm_tc_kernel(const half* __restrict__ A,
-const half* __restrict__ B,
-half* __restrict__ C,
-int M, int K, int N){
+                                const half* __restrict__ B,
+                                half* __restrict__ C,
+                                int M, int K, int N)
+{
     int tx = threadIdx.x;               // 0..31   tile 内的列偏移
     int ty = threadIdx.y;               // 0..3    = warp 编号
-    int btid = ty * 32 + tx;            // 0..127  线性线程号（搬数据时用）
+    int btid = ty * 32 + tx;            // 0..127  线性线程号（搬数据时用）   block: 32 * 4
 
     // 在 C 的32*32tile里的布局
     int warp_m = ty / 2;                // 0 1
@@ -203,8 +204,9 @@ int M, int K, int N){
         // 128线程装1024个元素，1个线程装8个元素
         for(int i = btid; i < 1024; i += 128)
         {
-            int r = i / 32;
-            int c = i % 32;
+            // 8轮迭代，每轮128个线程，搬128个数据，4 个 warp ———— 每个 warp 负责一整行，r 固定，c 从 0 到 31 连续   
+            int r = i / 32;         // 0 1 2 3 ... 31    i是从0到1024
+            int c = i % 32;         // 0 1 2 3 ... 31
             As[r][c] = A[(bm * 32 + r) * K + (k0 + c)];
             Bs[r][c] = B[(k0 + r) * N + (bn * 32 + c)];
         }
@@ -340,8 +342,73 @@ int M, int K, int N){
 
 
 
+// gemm nt变体   C=A×B^T ———— cuBLAS 的 NN/NT/TN/TT 四种布局         
+/*
+    NT 布局：B 存的是 [N][K]，即 Bs[n][k] 在内存里地址 = n*32 + k
+    wmma 要的 matrix_b 是 "K×N 的列主序"：逻辑 (k,n) 必须落在 k + n*ldm
+    所以 ldm = 32，指针 = &Bs[n_base][k_base] = &Bs[warp_n*16][kk] 
+*/
+__global__ void gemm_nt_kernel(const half* __restrict__ A,
+                                const half* __restrict__ B,
+                                half* __restrict__ C,
+                                int M, int K, int N)
+{
+    int tx = threadIdx.x;               // 0..31   tile 内的列偏移
+    int ty = threadIdx.y;               // 0..3    = warp 编号
+    int btid = ty * 32 + tx;            // 0..127  线性线程号（搬数据时用）   block: 32 * 4
 
+    // 在 C 的32*32tile里的布局
+    int warp_m = ty / 2;                // 0 1
+    int warp_n = ty % 2;                // 0 1
+    int bm = blockIdx.y;                // C tile 的行号
+    int bn = blockIdx.x;                // C tile 的列号
 
+    __shared__ half As[32][32];
+    __shared__ half Bs[32][32];
+    
+
+    __shared__ float Cf[32][32];      
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;   // NT：Bs 存的是 [n][k]，对 B 而言是列主序
+    wmma::fragment<wmma::accumulator, 16 ,16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);     
+
+    // 外层K循环
+    for(int k0 = 0; k0 < K; k0 += 32)
+    {
+        // 128线程装1024个元素，1个线程装8个元素
+        for(int i = btid; i < 1024; i += 128)
+        {
+            // 8轮迭代，每轮128个线程，搬128个数据，4 个 warp ———— 每个 warp 负责一整行，r 固定，c 从 0 到 31 连续   
+            int r = i / 32;         // 0 1 2 3 ... 31    i是从0到1024
+            int c = i % 32;         // 0 1 2 3 ... 31
+            As[r][c] = A[(bm * 32 + r) * K + (k0 + c)];
+            Bs[r][c] = B[(bn * 32 + r) * K + (k0 + c)];   // NT：r 走 N，c 走 K（B 存成 [N][K] 行主序）
+        }
+        __syncthreads();
+
+        for (int kk = 0; kk < 32; kk += 16) 
+        {             
+            wmma::load_matrix_sync(a_frag, &As[warp_m * 16][kk], 32);
+            wmma::load_matrix_sync(b_frag, &Bs[warp_n * 16][kk], 32);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+
+        __syncthreads();   // 下一轮要覆盖 As/Bs
+    }
+
+    // 写回累加器共享内存
+    wmma::store_matrix_sync(&Cf[warp_m * 16][warp_n * 16], c_frag, 32, wmma::mem_row_major);
+    __syncthreads();
+
+    for(int i = btid; i < 1024; i += 128)
+    {
+        int r = i / 32;
+        int c = i % 32;
+        C[(bm * 32 + r) * N + bn * 32 + c] = __float2half(Cf[r][c]);
+    }
+}   
 
 
 
@@ -433,6 +500,23 @@ torch::Tensor gemm_tc2(torch::Tensor A, torch::Tensor B){
     dim3 block(32, 16);             
     dim3 grid(N/64, M/64);
     gemm_tc2_kernel<<<grid, block>>>(
+        reinterpret_cast<const half*>(A.data_ptr<at::Half>()),
+        reinterpret_cast<const half*>(B.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(C.data_ptr<at::Half>()),
+        M, K, N);
+    return C;
+}
+
+
+torch::Tensor gemm_nt(torch::Tensor A, torch::Tensor B) {
+    int M = A.size(0), K = A.size(1);
+    int N = B.size(0);                       // ← B 是 [N, K]，不是 [K, N]
+    auto C = torch::empty({M, N}, A.options());
+
+    dim3 block(32, 4);                       // 128 线程 = 4 warp（和 gemm_tc 一样）
+    dim3 grid((N + 31) / 32, (M + 31) / 32);
+
+    gemm_nt_kernel<<<grid, block>>>(
         reinterpret_cast<const half*>(A.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(B.data_ptr<at::Half>()),
         reinterpret_cast<half*>(C.data_ptr<at::Half>()),
