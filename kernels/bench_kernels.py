@@ -279,6 +279,34 @@ REGISTRY: list[KernelSpec] = [
         ],
     ),
     KernelSpec(
+        name="gemm_nt",
+        cuda_file="kernels/w6_gemm.cu",
+        cpp_signature="torch::Tensor gemm_nt(torch::Tensor A, torch::Tensor B);",
+        functions=["gemm_nt"],
+        note="W6 变体：NT 布局 C = A·Bᵀ（A[M,K] 行主序、B[N,K] 行主序）。两操作数沿 K 都连续，"
+             "B fragment 用 col_major + ldm=32，装载起点 &Bs[warp_n*16][kk]。"
+             "反向里的 dA = dY·Bᵀ 就是这个形状",
+        cases=[
+            Case(
+                label="M=N=K=1024 fp16 (NT)",
+                shape=(1024, 1024, 1024),
+                dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "A": torch.randn(s[0], s[1], device=dev, dtype=d),   # [M, K]
+                    "B": torch.randn(s[2], s[1], device=dev, dtype=d),   # [N, K]
+                },
+                cuda_call=lambda mod, inp: mod.gemm_nt(inp["A"], inp["B"]),
+                ref_call=lambda inp: ref_gemm(inp["A"], inp["B"].transpose(0, 1).contiguous()),
+                nbytes=lambda s, d: (
+                    (s[0] * s[1] + s[2] * s[1] + s[0] * s[2])
+                    * workloads.elem_bytes(d)
+                ),
+                flops=lambda s, d: 2.0 * s[0] * s[2] * s[1],
+            ),
+        ],
+    ),
+
+    KernelSpec(
         name="rmsnorm",
         cuda_file="kernels/w2_rmsnorm.cu",
         cpp_signature=(
