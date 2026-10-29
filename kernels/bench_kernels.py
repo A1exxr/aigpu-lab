@@ -63,6 +63,14 @@ def ref_softmax(x):
     return F.softmax(x, dim=-1)
 
 
+def ref_softmax_backward(s, dy):
+    """softmax 反向的参考：dx = (dy - sum(dy*s)) * s（fp32 计算）"""
+    sf = s.float()
+    dyf = dy.float()
+    dot = (dyf * sf).sum(dim=-1, keepdim=True)
+    return ((dyf - dot) * sf).to(s.dtype)
+
+
 def ref_gelu(x):
     return F.gelu(x)
 
@@ -307,6 +315,36 @@ REGISTRY: list[KernelSpec] = [
     ),
 
     KernelSpec(
+        name="gemm_tn",
+        cuda_file="kernels/w6_gemm.cu",
+        cpp_signature="torch::Tensor gemm_tn(torch::Tensor A, torch::Tensor B);",
+        functions=["gemm_tn"],
+        note="W6 变体：TN 布局 C = Aᵀ·B（A 存成 [K,M]、B 存成 [K,N]）。"
+             "反向里的 dW = dYᵀ·X 就是这个形状；A fragment 用 col_major + ldm=32，"
+             "装载起点 &As[kk][warp_m*16]，smem 里存 As[k][m]（装载方向转置，但全局读仍合并）",
+        cases=[
+            Case(
+                label="M=N=K=1024 fp16 (TN)",
+                shape=(1024, 1024, 1024),
+                dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "A": torch.randn(s[1], s[0], device=dev, dtype=d),   # [K, M]
+                    "B": torch.randn(s[0], s[2], device=dev, dtype=d),   # [K, N]
+                },
+                cuda_call=lambda mod, inp: mod.gemm_tn(inp["A"], inp["B"]),
+                ref_call=lambda inp: ref_gemm(
+                    inp["A"].transpose(0, 1).contiguous(), inp["B"]
+                ),
+                nbytes=lambda s, d: (
+                    (s[0] * s[1] + s[0] * s[2] + s[1] * s[2])
+                    * workloads.elem_bytes(d)
+                ),
+                flops=lambda s, d: 2.0 * s[0] * s[1] * s[2],
+            ),
+        ],
+    ),
+
+    KernelSpec(
         name="rmsnorm",
         cuda_file="kernels/w2_rmsnorm.cu",
         cpp_signature=(
@@ -342,6 +380,30 @@ REGISTRY: list[KernelSpec] = [
                 ref_call=lambda inp: ref_softmax(inp["x"]),
                 nbytes=lambda s, d: workloads.bytes_softmax(s, d),
                 flops=lambda s, d: 5.0 * workloads.numel(s),
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="softmax_backward",
+        cuda_file="kernels/w9_softmax_backward.cu",
+        cpp_signature="torch::Tensor softmax_backward(torch::Tensor s, torch::Tensor dy);",
+        functions=["softmax_backward"],
+        note="W9：softmax 反向，dx_j = s_j(dy_j - Σ dy_i s_i)。一次行内归约 + 广播；"
+             "s/dy 留寄存器避免第二遍重读（3N 而非 5N）",
+        cases=[
+            Case(
+                label="(2048,4096) fp16",
+                shape=(2048, 4096), dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "s": torch.softmax(
+                        torch.randn(*s, device=dev, dtype=torch.float32), dim=-1
+                    ).to(d),
+                    "dy": torch.randn(*s, device=dev, dtype=d),
+                },
+                cuda_call=lambda mod, inp: mod.softmax_backward(inp["s"], inp["dy"]),
+                ref_call=lambda inp: ref_softmax_backward(inp["s"], inp["dy"]),
+                nbytes=lambda s, d: 3 * workloads.numel(s) * workloads.elem_bytes(d),
+                flops=lambda s, d: 0.0,
             ),
         ],
     ),
