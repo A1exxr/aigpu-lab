@@ -385,7 +385,11 @@ ncu --clock-control none --set full -c 1 \
 - **naive attention 的带宽利用率只有 6.8%**，不是测错：S² 矩阵要落显存四次往返，瓶颈在指令发射与 L1 扇区而非 HBM。它存在的意义是当 FlashAttention 的分母。
 - **GEMM 已用上 Tensor Core**：`wmma` 版本 0.2836 ms / 7.57 TFLOPS = PyTorch fp32 matmul 的 **1.13×**；
   台阶 4b（64×64 tile）反而慢 35%，原因是 24 KB 共享内存把每 SM 驻留 block 数从 12 压到 3、屏障无法被掩盖。
-  这条负结果比正结果更能说明"tile 大小要与占用率一起算"。未做：128×128 tile + `cp.async` 双缓冲流水。
+  这条负结果比正结果更能说明"tile 大小要与占用率一起算"。
+  **口径说明**：1.13× 的基线是 **fp32 matmul**。若基线换成 `torch.matmul`（fp16、走 Tensor Core），
+  按 7.57 TFLOPS 与 TC 理论值估算，本实现约为其 **0.2–0.4×**（未实测，仅估算）——
+  也就是说差距在 double buffering 与 swizzle，不在 mma 本身。
+  **进行中（2026-10-31 起）**：64×64 tile + 每 warp 2×2 + swizzle → double buffering + `cp.async`，目标 ≤ 0.19 ms。
 - **bench 与 ncu 两把尺子差 40%，原因未定论**（已排除降频/入队/分配器），见上方口径说明。
 - **PagedAttention decode 最优是 INT8 只量化 K**（1.0419 ms，194.4 GB/s = 87.8% 实测带宽）；
   fp16 版是 1.2483 ms / 97.6%。量化把流量从 256 降到 193 MiB，但窄流也把利用率拉低了 10 个点。
