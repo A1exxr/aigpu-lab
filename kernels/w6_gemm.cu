@@ -79,9 +79,14 @@ __global__ void gemm_tiled_kernel(const half* __restrict__ A,
 __global__ void gemm_reg_kernel(const half* __restrict__ A,
                                 const half* __restrict__ B,
                                 half* __restrict__ C,
-                                int M, int N, int K){
-    int row = blockIdx.y * 32 + threadIdx.y * 4;            // 全局行起点
-    int col = blockIdx.x * 32 + threadIdx.x * 4;            // 全局列起点
+                                int M, int N, int K)
+{
+    // 一个block有8*8=64个线程 = 2个warp
+    // 因为一个block要处理32*32的C块，1024/64=16，一个线程要处理16个C元素，就是4*4的C块
+    // 所以 blockIdx.y * 32 是这个block要处理的32行，在C的起始行
+    // threadIdx.y * 4 是线程在这个32*32 C块中的 4*4小块的起始行
+    int row = blockIdx.y * 32 + threadIdx.y * 4;           
+    int col = blockIdx.x * 32 + threadIdx.x * 4;            
     // 两者相加，就是这个线程负责的 4×4 子块左上角的全局坐标
 
     __shared__ half As[32][32];
@@ -131,6 +136,9 @@ __global__ void gemm_reg_kernel(const half* __restrict__ A,
         for(int kk = 0; kk < 32; ++kk)      // 遍历tile的32个位置，kk对应K下标
         {
             // 每个线程负责一个 4*4 的小块
+            // 这里不是直接在共享内存取值，然后直接乘加，有32次共享内存读写操作
+            // 先取到寄存器，8次共享内存读操作，然后就直接在寄存器里面进行计算
+            // 代价就是多了8个寄存器
             float a[4], b[4];
             // 读 4 个 A 元素 ———— 4×1 列向量  —— 4 行（ty*4+i）、第 kk 列
             // threadIdx.y * 4 + i	这个线程负责的 4 行（tile 内局部行号）
@@ -149,7 +157,7 @@ __global__ void gemm_reg_kernel(const half* __restrict__ A,
                 }
             }
         }
-        __syncthreads();
+        __syncthreads();        // 这个屏障要设置在k循环内部
     }
 
     // 写回 16 个值
