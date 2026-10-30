@@ -45,7 +45,7 @@ kernels/
   bench_kernels.py      # 复用 gpulab，测你自己的 kernel
 ```
 
-## 现状（2026-10-28）
+## 现状（2026-10-30）
 
 | kernel | 状态 | 关键数字 |
 |---|---|---|
@@ -58,6 +58,7 @@ kernels/
 | `w5_flash_attn.py` | 完成 | **0.474 ms**，达 PyTorch SDPA 的 91%，naive 的 1/32.8 |
 | `w6_gemm.cu` | **台阶 1–4 完成** | 2.42 → 1.78 → 0.657 → **0.2836 ms**（Tensor Core），超 PyTorch fp32 基线 1.13×；64×64 tile 反例更慢（0.3758） |
 | `w9_softmax_backward.cu` | 完成 | **0.2601 ms**，193.5 GB/s = 71.1%（标称）/ **87.4%（实测天花板）**；一次行内归约 + 寄存器驻留（3N 而非 5N），vs torch 表达式参考 8.13× |
+| `w10_layernorm_backward.cu` | 台阶1 完成（只算 dx） | **0.2980 ms**，168.9 GB/s = 62.1%（标称）/ **81.8%（实测天花板）**；4 次行内归约（Σx / Σx² / Σγdy / Σγdyx̂），x̂ 提前算使读写止于 3N；ncu：277.9 µs / 48 reg / 81.2% 占用 / DRAM 80.6%；dγ/dβ 的跨行归约留台阶2 |
 | `w6_gemm.cu` 变体（NT / TN） | 完成（对照） | NT **0.2867 ms**（≈NN，B 沿 K 连续）；TN **0.3820 ms**（A 存成 `[K,M]`，读端 `col_major` 按 `k*32` 跳，付 33% bank 冲突代价）；分别对应反向里的 `dA = dY·Bᵀ` 与 `dW = dYᵀ·X` |
 | `w7_paged_attn_split.cu` | 完成（已封板） | 2.3644 → 1.8897 → 1.5084 → **1.2483 ms**，216.0 GB/s = **97.6% 实测天花板** |
 | `w8_paged_attn_int8.cu` | 完成（最优） | 只量化 K：**1.0419 ms**，194.4 GB/s = 87.8% 实测天花板 |

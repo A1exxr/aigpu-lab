@@ -71,6 +71,26 @@ def ref_softmax_backward(s, dy):
     return ((dyf - dot) * sf).to(s.dtype)
 
 
+def ref_layernorm_backward(dy, x, gamma, eps=1e-5):
+    """LayerNorm 反向的参考：全程 fp32 计算 dx。
+
+    dx̂ = γ·dy  （梯度先退回 x̂）
+    dx = (1/σ)[ dx̂ − mean(dx̂) − x̂·mean(dx̂·x̂) ]
+    两个 mean 都在 dx̂ 上求，所以是【带 γ】的均值。
+    """
+    xf = x.float()
+    dyf = dy.float()
+    g = gamma.float()
+    mu = xf.mean(dim=-1, keepdim=True)
+    var = xf.var(dim=-1, unbiased=False, keepdim=True)
+    inv = (var + eps).rsqrt()
+    xhat = (xf - mu) * inv
+    gdy = g * dyf
+    s1 = gdy.mean(dim=-1, keepdim=True)
+    s2 = (gdy * xhat).mean(dim=-1, keepdim=True)
+    return (inv * (gdy - s1 - xhat * s2)).to(x.dtype)
+
+
 def ref_gelu(x):
     return F.gelu(x)
 
@@ -402,6 +422,34 @@ REGISTRY: list[KernelSpec] = [
                 },
                 cuda_call=lambda mod, inp: mod.softmax_backward(inp["s"], inp["dy"]),
                 ref_call=lambda inp: ref_softmax_backward(inp["s"], inp["dy"]),
+                nbytes=lambda s, d: 3 * workloads.numel(s) * workloads.elem_bytes(d),
+                flops=lambda s, d: 0.0,
+            ),
+        ],
+    ),
+    KernelSpec(
+        name="layernorm_backward",
+        cuda_file="kernels/w10_layernorm_backward.cu",
+        cpp_signature="torch::Tensor layernorm_backward(torch::Tensor dy, torch::Tensor x, "
+                      "torch::Tensor gamma, double eps);",
+        functions=["layernorm_backward"],
+        note="W10 台阶1：LayerNorm 反向只算 dx，dx_j = (1/σ)[γ_j dy_j − mean(γ·dy) − x̂_j·mean(γ·dy·x̂)]；"
+             "4 次行内归约（Σx、Σx²、Σdy、Σdy·x̂），x/dy 留寄存器避免第二遍重读（3N）",
+        cases=[
+            Case(
+                label="(2048,4096) fp16",
+                shape=(2048, 4096), dtype="fp16",
+                make_inputs=lambda s, d, dev: {
+                    "dy": torch.randn(*s, device=dev, dtype=d),
+                    "x": torch.randn(*s, device=dev, dtype=d),
+                    "gamma": torch.randn(s[-1], device=dev, dtype=d),
+                },
+                cuda_call=lambda mod, inp: mod.layernorm_backward(
+                    inp["dy"], inp["x"], inp["gamma"], 1e-5
+                ),
+                ref_call=lambda inp: ref_layernorm_backward(
+                    inp["dy"], inp["x"], inp["gamma"], 1e-5
+                ),
                 nbytes=lambda s, d: 3 * workloads.numel(s) * workloads.elem_bytes(d),
                 flops=lambda s, d: 0.0,
             ),
