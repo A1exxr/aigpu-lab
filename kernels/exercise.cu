@@ -45,35 +45,35 @@ __global__ void gemm_reg_kernel(const half* __restrict__ A,
                                 half* __restrict__ C,
                                 int M, int K, int N)
 {
-    // 一个block 负责 一个 32*32 的C块
-    int row = blockIdx.y * 32 + threadIdx.y * 4;    // 当前线程在C块的row坐标
-    int col = blockIdx.x * 32 + threadIdx.x * 4;    // 当前线程在C块的col坐标
+    // 这里是32*32小块，每个线程都是其中一个4*4小块
+    int row = blockIdx.y * 32 + threadIdx.y * 4;
+    int col = blockIdx.x * 32 + threadIdx.x * 4;
 
     __shared__ half As[32][32];
     __shared__ half Bs[32][32];
-
     float acc[4][4] = {0.f};
 
-    // 一个block 处理1024个元素，这个tile是32*32的，tile里还有小tile
-    for(int k = 0; k < K; k += 32)
-    {
-        for(int idx = threadIdx.y * 8 + threadIdx.x; idx < 1024; idx+=64){
-            // 装载A B 块
-            // idx在tile里的偏移
-            int r = idx / 32;           // idx在32*32的C块里的哪一行
-            int c = idx % 32;           // idx在哪一列
+    float a[4] = {0.f};
+    float b[4] = {0.f};
 
-            As[r][c] = A[(blockIdx.y * 32 + r) * K + k + c];
-            Bs[r][c] = B[(k + r) * N + blockIdx.x * 32 + c];
+    // 沿着K维归约
+    for(int k0 = 0; k0 < K; k0 += 32)
+    {
+        // 把block中的8*8线程id展开到1维；1个block处理1024个元素
+        for(int tid = threadIdx.y * 8 + threadIdx.x; tid < 1024; tid += 64)
+        {
+            int r = tid / 32;      // 线程在32*32tile里的行索引
+            int c = tid % 32;
+
+            As[r][c] = A[(blockIdx.y * 32 + r) * K + k0 + c];
+            Bs[r][c] = B[(k0 + r) * N + blockIdx.x * 32 + c];            
         }
         __syncthreads();
-
+        // 不能把计算写进装载的循环里
+        // 但是装载和计算都是在同一个K块里，先装载，然后就计算
         for(int kk = 0; kk < 32; ++kk)
         {
-             // 从共享内存到寄存器
-            float a[4] = {0.f};
-            float b[4] = {0.f};
-            
+            // 把值存到寄存器里
             for(int i = 0; i < 4; ++i)
             {
                 a[i] = __half2float(As[threadIdx.y * 4 + i][kk]);
@@ -90,11 +90,10 @@ __global__ void gemm_reg_kernel(const half* __restrict__ A,
                     acc[i][j] += a[i] * b[j];
                 }
             }
-        }
-        __syncthreads();  // 在k循环内部
+        }       
+        __syncthreads();
     }
 
-    
     for(int i = 0; i < 4; ++i)
     {
         for(int j = 0; j < 4; ++j)
@@ -105,3 +104,68 @@ __global__ void gemm_reg_kernel(const half* __restrict__ A,
 
 }
 
+#include<mma.h>
+using namespace nvcuda;
+
+__global__ void gemm_tc_kernel(const half* __restrict__ A,
+                                const half* __restrict__ B,
+                                half* __restrict__ C,
+                                int M, int K, int N)
+{
+    // grid(32,32)
+    // 一个block负责32*32的C块，4个warp，1个warp负责一个16*16的小块，通过tensor core
+    // block是4*32=128线程
+    int tx = threadIdx.x;       // 0 1 2 ... 31
+    int ty = threadIdx.y;       // 0 1 2 3 
+    int bid = ty * 32 + tx;     // 0 1 2 ... 127
+
+    int warp_m = ty / 2;        // 在32*32C块里 warp处理的16*16小块的行索引
+    int warp_n = ty % 2;    
+
+    int cm = blockIdx.y;        // C块的行索引
+    int cn = blockIdx.x;
+
+    __shared__ half As[32][32];
+    __shared__ half Bs[32][32];
+    __shared__ float Cf[32][32];
+
+    wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> a_reg;
+    wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> b_reg;
+    wmma::fragment<wmma::accumulator,16,16,16,float> c_reg;
+    wmma::fill_fragment(c_reg, 0.0f);
+
+
+    // 沿着K维归约
+    for(int k0 = 0; k0 < K; k0 += 32)
+    {
+        // 在32*32的C块里，有4个16*16的小块
+        for(int i = bid; i < 1024; i += 128)
+        {
+            int r = bid / 32;
+            int c = bid % 32;
+
+            As[r][c] = A[(cm * 32 + r) * K + k0 + c];
+            Bs[r][c] = B[(k0 + r) * N + cn * 32 + c];
+        }
+        __syncthreads();
+
+        for(int kk = 0; kk < 32; kk += 16)
+        {
+            wmma::load_matrix_sync(a_reg, &As[warp_m * 16][kk], 32);
+            wmma::load_matrix_sync(b_reg, &Bs[kk][warp_n * 16], 32);
+            wmma::mma_sync(c_reg, a_reg, b_reg, c_reg);
+        }
+        __syncthreads();
+    }
+
+    // 写回累加器
+    wmma::store_matrix_sync(&Cf[warp_m * 16][warp_n * 16], c_reg, 32, wmma::mem_row_major);
+    __syncthreads();
+
+    for(int i = bid; i < 1024; i += 128)
+    {
+        int r = bid / 32;
+        int c = bid % 32;
+        C[(blockIdx.y * 32 + r) * N + blockIdx.x * 32 + c] = __float2half(Cf[r][c]);
+    }
+}
