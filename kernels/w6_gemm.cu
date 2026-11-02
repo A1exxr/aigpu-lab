@@ -171,24 +171,26 @@ __global__ void gemm_reg_kernel(const half* __restrict__ A,
 
 }
 
-
-
+// 1024, 1024, 1024  台阶1到5都是这个形状
 // 台阶4  ———— 一整个 warp（32 个线程）协作算一块 16×16 —————— 采用WMMA（张量核心），1 个 warp 各管一个 16×16，Tensor Core 一次算完 16×16×16 = 4096 次乘加
 // 一个block 有 4 个warp， 处理32*32的C块
+// Tensor Core 编程接口就是 warp 级的，一个 warp 内的 32 个线程必须协作完成一次矩阵乘加操作
 __global__ void gemm_tc_kernel(const half* __restrict__ A,
                                 const half* __restrict__ B,
                                 half* __restrict__ C,
                                 int M, int K, int N)
 {
+    // 设置的block是(4,32)
+    // grid(N/32, M/32) ——> (32,32)  1024个block
     int tx = threadIdx.x;               // 0..31   tile 内的列偏移
-    int ty = threadIdx.y;               // 0..3    = warp 编号
-    int btid = ty * 32 + tx;            // 0..127  线性线程号（搬数据时用）   block: 32 * 4
+    int ty = threadIdx.y;               // 0..3    tile 内的 warp 编号
+    int btid = ty * 32 + tx;            // 0..127  一个block 128个线程，要处理32*32=1024个数据，一个线程要搬8个数据
 
-    // 在 C 的32*32tile里的布局
+    // 在 C 的32*32tile里的布局，warp的行 列索引
     int warp_m = ty / 2;                // 0 1
     int warp_n = ty % 2;                // 0 1
-    int bm = blockIdx.y;                // C tile 的行号
-    int bn = blockIdx.x;                // C tile 的列号
+    int bm = blockIdx.y;                // 行方向：第几个 32 行的 tile
+    int bn = blockIdx.x;                // 列方向：第几个 32 列的 tile
 
     __shared__ half As[32][32];
     __shared__ half Bs[32][32];
@@ -258,6 +260,8 @@ __global__ void gemm_tc_kernel(const half* __restrict__ A,
     wmma::store_matrix_sync(&Cf[warp_m * 16][warp_n * 16], c_frag, 32, wmma::mem_row_major);
     __syncthreads();
 
+    // 这样写是因为 warp 内连续、合并访存、不重不漏
+    // 也可以写成双循环，也是合并访存，但是多了一层循环，没必要
     for(int i = btid; i < 1024; i += 128)
     {
         int r = i / 32;
@@ -267,13 +271,15 @@ __global__ void gemm_tc_kernel(const half* __restrict__ A,
 }   
 
 
-// 台阶4 ———— 优化成 处理 64*64 的 C块
+// 台阶5 ———— 优化成 处理 64*64 的 C块
 // 现在一个warp还是处理 16 * 16 的C块， 现在需要16个warp才能处理一个 64 * 64的C块，所以一个block有16个warp，512个线程
-// grid形状(32,16) = 512 线程 = 16 warp
+// grid形状(16,16)，256个block， block有 32*16 = 512 线程 = 16 warp
 __global__ void gemm_tc2_kernel(const half* __restrict__ A,
-const half* __restrict__ B,
-half* __restrict__ C,
-int M, int K, int N){
+                                const half* __restrict__ B,
+                                half* __restrict__ C,
+                                int M, int K, int N)
+{
+    // 16个warp，512个线程 
     int tx = threadIdx.x;                   // 0 1 2 ... 31
     int ty = threadIdx.y;                   // 0 1 2 ... 15       也可以看作 warp 编号
     int btid = ty * 32 + tx;                // 0 1 2 ... 511
@@ -622,8 +628,8 @@ torch::Tensor gemm_tc(torch::Tensor A, torch::Tensor B){
     // 这里block设置成128个线程，4个warp， (32,4)是为了让ty对应warp_id —— 0 1 2 3
     // 一个tile是32*32，一个warp计算16*16小块
     // 通过ty来对应tile的4个小块，ty=0 左上、ty=1 右上、ty=2 左下、ty=3 右下
-    dim3 block(32, 4);              
-    dim3 grid(N/32, M/32);
+    dim3 block(32, 4);                     
+    dim3 grid(N/32, M/32);      
 
     gemm_tc_kernel<<<grid, block>>>(
         reinterpret_cast<const half*>(A.data_ptr<at::Half>()),

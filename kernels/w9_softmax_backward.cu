@@ -10,10 +10,10 @@
 #define ELEMS_PER_THREAD 16          // cols = 4096 时 256*16 = 4096
 
 __global__ void softmax_backward_kernel(
-    const half* __restrict__ s,      // softmax 的输出，[rows, cols]
-    const half* __restrict__ dy,     // loss 对 s 的梯度，[rows, cols]
-    half* __restrict__ dx,           // 输出，[rows, cols]
-    int rows, int cols)
+                                        const half* __restrict__ s,      // softmax 的输出，[rows, cols]
+                                        const half* __restrict__ dy,     // loss 对 s 的梯度，[rows, cols]
+                                        half* __restrict__ dx,           // 输出，[rows, cols]
+                                        int rows, int cols)
 {
 
     int row = blockIdx.x;                 // 1个block负责1行
