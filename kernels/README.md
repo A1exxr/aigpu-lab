@@ -64,7 +64,7 @@ kernels/
 | `w8_paged_attn_int8.cu` | 完成（最优） | 只量化 K：**1.0419 ms**，194.4 GB/s = 87.8% 实测天花板 |
 | `w8_paged_attn_int8kv*.cu` | 完成（三个反例） | KV 全量化 1.2032 / 再加 vec4 1.5503 / 再加 split-L 1.1223，均不如只量化 K |
 | `w11_attn_bwd.py`（台阶 1–3） | 完成 | 台阶1 单块 3.6e-7 / 台阶2 分块+atomic 6.0e-7（5.03 ms）/ 台阶3 拆两 kernel 无 atomic（5.50 ms，1.09× 台阶2，**逐位可复现**），判据均为 1e-5(fp32+ieee) |
-| `w11_attn_bwd.py`（台阶 4） | 完成（最优） | **0.520 ms**，fp16 + Tensor Core，判据 2e-3（实测 3.9e-4 / 3.8e-4 / 4.4e-4）；相对 fp32+ieee **10.85×**；两个 fp32 累加 dot 仍走 CUDA Core，是剩余瓶颈 |
+| `w11_attn_bwd.py`（台阶 4） | 完成（最优） | **0.514 ms**（3 轮取最小），fp16 + Tensor Core，判据 2e-3（实测 3.9e-4 / 3.8e-4 / 4.4e-4）；相对自己写的 fp32+ieee **10.8×**；**为 PyTorch SDPA 反向（0.309 ms）的 1.66×**；两个 fp32 累加 dot 仍走 CUDA Core，是剩余瓶颈 |
 
 ## 每个 kernel 的验收清单
 
