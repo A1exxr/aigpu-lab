@@ -180,13 +180,15 @@ __global__ void gemm_tc_kernel(const half* __restrict__ A,
                                 half* __restrict__ C,
                                 int M, int K, int N)
 {
-    // 设置的block是(4,32)
+    // 设置的block是(32,4)  x是32，连续维，列方向 blockDim.x = 32
     // grid(N/32, M/32) ——> (32,32)  1024个block
     int tx = threadIdx.x;               // 0..31   tile 内的列偏移
     int ty = threadIdx.y;               // 0..3    tile 内的 warp 编号
     int btid = ty * 32 + tx;            // 0..127  一个block 128个线程，要处理32*32=1024个数据，一个线程要搬8个数据
 
     // 在 C 的32*32tile里的布局，warp的行 列索引
+    // warp 的区分只发生在 load_matrix_sync 读 shared 时
+    // 多个 warp 拼一个大于 16×16 的 C tile 时，需要用坐标告诉每个 warp 负责哪块
     int warp_m = ty / 2;                // 0 1
     int warp_n = ty % 2;                // 0 1
     int bm = blockIdx.y;                // 行方向：第几个 32 行的 tile
@@ -625,10 +627,10 @@ torch::Tensor gemm_tc(torch::Tensor A, torch::Tensor B){
     int N = B.size(1);
     auto C = torch::empty({M, N}, A.options());
 
-    // 这里block设置成128个线程，4个warp， (32,4)是为了让ty对应warp_id —— 0 1 2 3
+    // 这里block设置成128个线程，4个warp， (32,4)，blockDim.x=32，是为了让ty对应warp_id —— 0 1 2 3
     // 一个tile是32*32，一个warp计算16*16小块
     // 通过ty来对应tile的4个小块，ty=0 左上、ty=1 右上、ty=2 左下、ty=3 右下
-    dim3 block(32, 4);                     
+    dim3 block(32, 4);                  // dim3	(x, y) ———— x 是列方向（最内层/连续维） 32，  y=行方向 4          
     dim3 grid(N/32, M/32);      
 
     gemm_tc_kernel<<<grid, block>>>(
