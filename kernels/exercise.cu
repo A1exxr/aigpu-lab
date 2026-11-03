@@ -2,9 +2,10 @@
 
 
 __global__ void gemm_tile_kernel(const half* __restrict__ A,
-const half* __restrict__ B,
-half* __restrict__ C,
-int M, int K, int N){
+                                const half* __restrict__ B,
+                                half* __restrict__ C,
+                                int M, int K, int N)
+{
     // 一个线程算一个C元素，分块32*32
     int col = blockIdx.x * blockDim.x + threadIdx.x;   // 全局列  C的列   B的行
     int row = blockIdx.y * blockDim.y + threadIdx.y;    // 全局行  C的行 A的列
@@ -166,6 +167,64 @@ __global__ void gemm_tc_kernel(const half* __restrict__ A,
     {
         int r = bid / 32;
         int c = bid % 32;
+        C[(blockIdx.y * 32 + r) * N + blockIdx.x * 32 + c] = __float2half(Cf[r][c]);
+    }
+}
+
+
+// 写一个 tensor core 矩阵乘
+__global__ void gemm_tc_kernel(const half* __restrict__ A,
+const half* __restrict__ B,
+half* __restrict__ C,
+int M, int K, int N){
+    // C块 32 * 32    一个warp处理16*16的小块，4个warp处理一个C块，4个warp是一个block
+    // block是(32,4)  规模
+    int tx = threadIdx.x;       // 0 1 2 ... 31
+    int ty = threadIdx.y;       // 0 1 2 3
+    int bid = ty * 32 + tx;     // 0 1 2 ... 127        128个线程
+
+    int warp_m = ty / 2;        // warp在C块里的行索引 4个warp
+    int warp_n = ty % 2;
+
+    __shared__ half As[32][32];
+    __shared__ half Bs[32][32];
+    __shared__ float Cf[32][32];        // 累加器
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_freg;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+
+    // 沿着K维归约
+    for(int k0 = 0; k0 < K; k0 += 32)
+    {
+        // 装载数据到共享内存
+        for(int i = bid; i < 1024; i += 128)
+        {
+            int r = i / 32;
+            int c = i % 32;
+            As[r][c] = A[(blockIdx.y * 32 + r) * K + k0 + c];
+            Bs[r][c] = B[(k0 + r) * N + blockIdx.x * 32 + c];
+        }
+        __syncthreads();
+
+        for(int kk = 0; kk < 32; kk += 16)
+        {
+            wmma::load_matrix_sync(a_frag, &As[warp_m * 16][kk], 32);
+            wmma::load_matrix_sync(b_freg, &Bs[kk][warp_n * 16], 32);
+            wmma::mma_sync(c_frag, a_frag, b_freg, c_frag);
+        }
+        __syncthreads();
+
+    }
+    wmma::store_matrix_sync(&Cf[warp_m*16][warp_n*16], c_frag, 32, wmma::mem_row_major);
+    __syncthreads();
+
+    for(int i = bid; i < 1024; i += 1024)
+    {
+        int r = i / 32;
+        int c = i % 32;
         C[(blockIdx.y * 32 + r) * N + blockIdx.x * 32 + c] = __float2half(Cf[r][c]);
     }
 }
