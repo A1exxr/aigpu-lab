@@ -39,3 +39,9 @@ notes/cuda-guide-读书笔记.txt
 # 编译产物（实验程序）
 exp_sched
 *.out
+
+# 本地编译产物（可执行文件）
+kernels/w6_1gemm
+kernels/w6_2gemm
+kernels/cpasync
+*.o
