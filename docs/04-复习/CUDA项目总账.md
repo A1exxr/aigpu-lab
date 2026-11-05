@@ -25,7 +25,7 @@
 | 4 | Fused RMSNorm+Residual | `w3_fused_rmsnorm_residual.cu` | 199.9 µs / **92.8%** | 两步 390 µs → **1.95×** | 5 流 → 3 流（96→48 MiB），融合是突破带宽天花板的唯一办法 |
 | 5 | Attention naive | `w4_attn_naive.cu` | **15.5 ms** | 46.9 ms → **3.0×** | 跨行读 K 的扇区利用率 6.25% → warp-per-j 对齐后 100% |
 | 6 | FlashAttention（Triton） | `w5_flash_attn.py` | **0.474 ms / 18.1 TFLOPS** | naive → **32.8×**，SDPA 的 91% | online softmax 让 S² 不再落显存 |
-| 7 | GEMM 六台阶 | `w6_gemm.cu` / `w6_2gemm.cu` | **0.136 ms** | 2.42 ms → **17.8×**；同进程 cuBLAS fp16 0.090 ms，差 1.51×（66%） | naive → tiling → 寄存器分块 → Tensor Core → uint4 → cp.async → 64×64 tile |
+| 7 | GEMM 六台阶 | `w6_gemm.cu` / `w6_2gemm.cu` | **0.101 ms** | 2.42 ms → **24.0×**；同进程 cuBLAS fp16 0.0834 ms，差 1.21×（83%） | naive → tiling → 寄存器分块 → Tensor Core → uint4 → cp.async → 64×64 tile → smem 跨度补齐 |
 | 8 | PagedAttention decode | `w7_paged_attn*.cu` | **1.2483 ms / 97.6%** | 2.3644 → **1.89×** | 块映射 + split-L；单 kernel 已到墙 |
 | 9 | INT8 量化（8 版对照） | `w8_*.cu` | **1.0419 ms / 87.8%** | 1.2483 → **1.20×** | 1 正例 3 反例：省字节 ≠ 变快，每指令字节数才是关键 |
 | 10 | 调度层（launch/graph/stream） | `exp_sched.cu` | **8.52 µs** launch | graph N=64：61.4 → 8.52 | 单 kernel 到墙后，瓶颈上移到提交与调度 |

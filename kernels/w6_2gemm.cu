@@ -9,7 +9,7 @@
 //   5b：把装载换成 cp.async + 双缓冲（等 5a 测完再加）
 //
 // 编译 & 运行：
-//   nvcc -O3 -arch=sm_89 W6_1gemm.cu -o W6_1gemm && ./W6_1gemm
+//   nvcc w6_2gemm.cu -o w6_2gemm -arch=sm_89 -lcublas
 // ============================================================================
 
 #include <cuda_fp16.h>
@@ -291,6 +291,7 @@ __global__ void gemm_tc5c_kernel(const half* __restrict__ A,
 
         // 预取 i+2 那一块，放到 (i+2)%3 号缓冲
         if (i + 2 < NB) {
+            // n 级流水 → 预取 i+(n-1) ——> 就直接填 (i+(n-1)) % n 
             ISSUE(i + 2, (i + 2) % 3)           // (i+2)%3 = (i-1)%3， 是上一轮（i-1）用过的 buffer
         }
 
@@ -314,11 +315,11 @@ __global__ void gemm_tc5c_kernel(const half* __restrict__ A,
     wmma::store_matrix_sync(&Cf[warp_m * 16][warp_n * 16], c_frag, 32, wmma::mem_row_major);
     __syncthreads();
 
-    for (int idx2 = btid; idx2 < 1024; idx2 += 128)
+    for (int i = btid; i < 1024; i += 128)
     {
-        int rr = idx2 / 32;
-        int cc = idx2 % 32;
-        C[(bm * 32 + rr) * n + bn * 32 + cc] = __float2half(Cf[rr][cc]);
+        int r = i / 32;
+        int c = i % 32;
+        C[(bm * 32 + r) * n + bn * 32 + c] = __float2half(Cf[r][c]);
     }
 }
 
@@ -326,11 +327,12 @@ __global__ void gemm_tc5c_kernel(const half* __restrict__ A,
 // 台阶 6：C tile 64×64，每 warp 算 32×32（4 个 16×16 fragment）
 //
 // 与台阶5b（C tile 32×32，每 warp 16×16）的差别只有两处：
-//   ① tile 大 4 倍 → K 循环里每装一块 A/B，能算的 C 元素多 4 倍（smem 复用率翻倍）
-//   ② 每个 warp 持有 4 个累加器 → 4 次 mma 摊 2 次 load（a/b 各 2 次）
+//   tile 大 4 倍 → K 循环里每装一块 A/B，能算的 C 元素多 4 倍（smem 复用率翻倍）
+//   每个 warp 持有 4 个累加器 → 4 次 mma 摊 2 次 load（a/b 各 2 次）
 //
 // smem：As[2][64][32] + Bs[2][32][64] = 16 KB（双缓冲）
 // 线程：block(32,4) = 128 = 4 warp，warp 布局 2×2，每 warp 管 32×32
+// grid：(16,16) 256个warp
 // 直写全局，不再用 Cf 中转（省 16 KB，否则只有 3 个 block 能驻留）
 // ----------------------------------------------------------------------------
 #define TILE6 64
@@ -349,10 +351,10 @@ __global__ void gemm_tc6_kernel(const half* __restrict__ A,
     int bm = blockIdx.y;      // 行块号（M 方向）
     int bn = blockIdx.x;      // 列块号（N 方向）
 
-    __shared__ __align__(16) half As[2][TILE6][32];
-    __shared__ __align__(16) half Bs[2][32][TILE6];
-    // float 累加器只能 store 到 float*，所以需要一个 float 中转区（16 KB）
-    __shared__ __align__(16) float Cf[TILE6][TILE6];
+    // 双缓冲
+    __shared__ __align__(16) half As[2][64][40];
+    __shared__ __align__(16) half Bs[2][32][72];
+    __shared__ __align__(16) float Cf[64][68];
 
     // 每个 warp：a 两片、b 两片、c 四个
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag[2];
@@ -364,19 +366,22 @@ __global__ void gemm_tc6_kernel(const half* __restrict__ A,
 
     const int NB = k / 32;    // k 方向的块数
 
-// 把第 blk 个 k 块搬进缓冲 buf。每线程每次搬 8 个 half = 16 B，
-// A tile 有 64×32/8 = 256 块 → 128 线程搬 2 轮；B tile 32×64 同理。
-#define LOAD6(blk, buf)                                                             \
-    for (int t = 0; t < 2; ++t) {                                                   \
-        int ch = t * 128 + btid;                                                    \
-        int ra = ch / 4, ca = (ch % 4) * 8;                                         \
-        __pipeline_memcpy_async(&As[buf][ra][ca],                                   \
-                                &A[(bm * TILE6 + ra) * k + (blk) * 32 + ca], 16);   \
-        int rb = ch / 8, cb = (ch % 8) * 8;                                         \
-        __pipeline_memcpy_async(&Bs[buf][rb][cb],                                   \
-                                &B[((blk) * 32 + rb) * n + bn * TILE6 + cb], 16);   \
-    }                                                                               \
+// 把第 blk 个 k 块搬进缓冲 buf，每线程每次搬 8 个 half = 16 B，
+// A块要放32*64=2048个元素，2048/8/128=2次，每个线程，每次搬8个half，要搬两次
+// 这里A是64*32的tile，每行是4个uint4
+// B是32*64的tile，每行是8个uint4，所以As和Bs的行列索引不一样
+#define LOAD6(blk, buf)                                                                     \
+    for (int t = 0; t < 2; ++t) {                                                           \
+        int ch = t * 128 + btid;                                                            \
+        int ra = ch / 4, ca = (ch % 4) * 8;                                                 \
+        __pipeline_memcpy_async(&As[buf][ra][ca],                                           \
+                                &A[(bm * TILE6 + ra) * k + (blk) * 32 + ca], 16);           \
+        int rb = ch / 8, cb = (ch % 8) * 8;                                                 \
+        __pipeline_memcpy_async(&Bs[buf][rb][cb],                                           \
+                                &B[((blk) * 32 + rb) * n + bn * TILE6 + cb], 16);           \
+    }                                                                                       \
     __pipeline_commit();
+    // 宏定义结束
 
     LOAD6(0, 0)
 
@@ -395,10 +400,12 @@ __global__ void gemm_tc6_kernel(const half* __restrict__ A,
         for (int kk = 0; kk < 32; kk += 16)
         {
             // 一次装 2 片 a、2 片 b，然后做 4 次 mma（这就是复用率的来源）
-            wmma::load_matrix_sync(a_frag[0], &As[cur][warp_m * 32 + 0][kk], 32);
-            wmma::load_matrix_sync(a_frag[1], &As[cur][warp_m * 32 + 16][kk], 32);
-            wmma::load_matrix_sync(b_frag[0], &Bs[cur][kk][warp_n * 32 + 0], TILE6);
-            wmma::load_matrix_sync(b_frag[1], &Bs[cur][kk][warp_n * 32 + 16], TILE6);
+            // 每个 warp 负责 C 的 32×32，而 WMMA 的 fragment 只有 16×16，所以拆成 2×2 = 4 个 c_frag
+            // 每轮 K 步长 16 时，A 取 2 个 16×16 片（M 方向切两半）、B 取 2 个 16×16 片（N 方向切两半），做 2×2 外积 = 4 次 mma
+            wmma::load_matrix_sync(a_frag[0], &As[cur][warp_m * 32 + 0][kk], 40);
+            wmma::load_matrix_sync(a_frag[1], &As[cur][warp_m * 32 + 16][kk], 40);
+            wmma::load_matrix_sync(b_frag[0], &Bs[cur][kk][warp_n * 32 + 0], 72);
+            wmma::load_matrix_sync(b_frag[1], &Bs[cur][kk][warp_n * 32 + 16], 72);
             for (int ii = 0; ii < 2; ++ii) {
                 for (int jj = 0; jj < 2; ++jj) {
                     wmma::mma_sync(c_frag[ii * 2 + jj], a_frag[ii], b_frag[jj], c_frag[ii * 2 + jj]);
@@ -413,7 +420,7 @@ __global__ void gemm_tc6_kernel(const half* __restrict__ A,
     for (int ii = 0; ii < 2; ++ii) {
         for (int jj = 0; jj < 2; ++jj) {
             float* pdst = &Cf[warp_m * 32 + ii * 16][warp_n * 32 + jj * 16];
-            wmma::store_matrix_sync(pdst, c_frag[ii * 2 + jj], TILE6, wmma::mem_row_major);
+            wmma::store_matrix_sync(pdst, c_frag[ii * 2 + jj], 68, wmma::mem_row_major);
         }
     }
     __syncthreads();
@@ -585,7 +592,8 @@ int main()
         printf("%-16s %8.4f %8.2f %6.1f%% %7.1f%%\n", names[i], best[i], tf,
                tf / PEAK * 100.0, best_cu / best[i] * 100.0);
     }
-    printf("\n注：%%cuBLAS = 我方达到 cuBLAS 的比例；1.52x 慢 ≈ 66%%\n");
+    printf("\n注：%%cuBLAS = cuBLAS 时间 / 我方时间（逐行现算）；本次台阶6 = %.1f%% of cuBLAS = %.2fx 慢\n",
+           best_cu / best[3] * 100.0, best[3] / best_cu);
 
     cublasDestroy(g_handle);
     return 0;
