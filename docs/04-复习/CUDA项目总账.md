@@ -25,7 +25,7 @@
 | 4 | Fused RMSNorm+Residual | `w3_fused_rmsnorm_residual.cu` | 199.9 µs / **92.8%** | 两步 390 µs → **1.95×** | 5 流 → 3 流（96→48 MiB），融合是突破带宽天花板的唯一办法 |
 | 5 | Attention naive | `w4_attn_naive.cu` | **15.5 ms** | 46.9 ms → **3.0×** | 跨行读 K 的扇区利用率 6.25% → warp-per-j 对齐后 100% |
 | 6 | FlashAttention（Triton） | `w5_flash_attn.py` | **0.474 ms / 18.1 TFLOPS** | naive → **32.8×**，SDPA 的 91% | online softmax 让 S² 不再落显存 |
-| 7 | GEMM 四台阶 | `w6_gemm.cu` | **0.284 ms** | 2.42 ms → **8.5×**，超 torch fp32 **1.13×** | naive → tiling → 寄存器分块 → Tensor Core |
+| 7 | GEMM 六台阶 | `w6_gemm.cu` / `w6_2gemm.cu` | **0.136 ms** | 2.42 ms → **17.8×**；同进程 cuBLAS fp16 0.090 ms，差 1.51×（66%） | naive → tiling → 寄存器分块 → Tensor Core → uint4 → cp.async → 64×64 tile |
 | 8 | PagedAttention decode | `w7_paged_attn*.cu` | **1.2483 ms / 97.6%** | 2.3644 → **1.89×** | 块映射 + split-L；单 kernel 已到墙 |
 | 9 | INT8 量化（8 版对照） | `w8_*.cu` | **1.0419 ms / 87.8%** | 1.2483 → **1.20×** | 1 正例 3 反例：省字节 ≠ 变快，每指令字节数才是关键 |
 | 10 | 调度层（launch/graph/stream） | `exp_sched.cu` | **8.52 µs** launch | graph N=64：61.4 → 8.52 | 单 kernel 到墙后，瓶颈上移到提交与调度 |
@@ -75,10 +75,10 @@
 | 1 naive | 每线程 1 元素，直读全局 | 2.42 ms | 1× |
 | 2 tiling | 32×32 共享内存块 | 1.784 ms | 1.36× |
 | 3 寄存器分块 | 每线程 4×4，block 8×8 | **0.6574 ms** | 3.7× |
-| 4 Tensor Core | wmma 16×16×16 | **0.284 ms** | 8.5×，超 torch fp32 1.13× |
+| 4 Tensor Core | wmma 16×16×16 | **0.284 ms** | 8.5×；与 cuBLAS fp16 差 3.50× |
 | 4b 反例 | 64×64 tile | 0.3758 ms | 更慢：24 KB smem ⇒ 占用率掉 |
 - **共享内存读取摊薄 4 倍**（每读服务 4 次 FMA）
-- 追问：为什么只到 1.13×？（缺 warp 级 mma、缺双缓冲 pipeline、缺 swizzle）
+- 追问：为什么只到 cuBLAS fp16 的 22%？（缺 warp 级 mma、缺双缓冲 pipeline、缺 swizzle）
 
 ### 8. PagedAttention —— 4 个台阶
 | 版本 | 时间 | 带宽 | 说明 |
@@ -116,7 +116,7 @@
 - [ ] 能解释扇区利用率 6.25% 是怎么算出来的
 - [ ] 能解释融合为什么能突破带宽天花板（3 流 vs 5 流）
 - [ ] 能解释 INT8 为什么"省字节但更慢"
-- [ ] 能说出 GEMM 只到 1.13× 的三个原因
+- [ ] 能说出 GEMM 只到 cuBLAS 22% 的三个原因
 - [ ] 能说出 FlashAttention 的代价（重复读 K/V）
 - [ ] 能说出 launch 8.52 µs 与你项目的因果关系（到墙 → 往上找）
 - [ ] 抽 3 题错题本 `待验证清单`，闭卷回答
