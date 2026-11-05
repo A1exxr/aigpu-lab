@@ -1,8 +1,8 @@
 // ============================================================================
 // W6_1gemm.cu —— GEMM 台阶5：向量化装载 + cp.async 双缓冲
 //
-// 基线：台阶4（wmma，block 32x4，C tile 32x32）实测 0.2836 ms / 7.57 TFLOPS
-// 目标：0.20 ~ 0.23 ms
+// 基准：cuBLAS fp16（同一进程、同一 event、交替计时）—— 本文件的唯一比较基准
+// 历史：台阶4（wmma）0.2836 ms → 5b 0.1754 ms → 6 0.1232 ms（cuBLAS 0.0811 ms）
 //
 // 台阶5 拆成两个子步骤，一次只改一件事：
 //   5a：把装载从「逐元素 half」改成「uint4 一次 16 B」  ← 本文件先做这个
@@ -14,6 +14,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 #include <mma.h>
 #include <cstdio>
 #include <cstdlib>
@@ -27,64 +28,6 @@ using namespace nvcuda;
 constexpr int M = 1024;
 constexpr int N = 1024;
 constexpr int K = 1024;
-
-// ----------------------------------------------------------------------------
-// 基线：台阶4 原样搬过来（已验证正确，0.2836 ms）
-// ----------------------------------------------------------------------------
-__global__ void gemm_tc_kernel(const half* __restrict__ A,
-                               const half* __restrict__ B,
-                               half* __restrict__ C,
-                               int m, int k, int n)
-{
-    int tx   = threadIdx.x;               // 0..31   tile 内的列偏移
-    int ty   = threadIdx.y;               // 0..3    tile 内的 warp 编号
-    int btid = ty * 32 + tx;              // 0..127  一个block 128个线程，要处理32*32=1024个数据，一个线程要搬8个数据
-
-    int warp_m = ty / 2;                  // 0 1
-    int warp_n = ty % 2;                  // 0 1
-    int bm = blockIdx.y;                  // 行方向：第几个 32 行的 tile
-    int bn = blockIdx.x;                  // 列方向：第几个 32 列的 tile
-
-    __shared__ half  As[32][32];
-    __shared__ half  Bs[32][32];
-    __shared__ float Cf[32][32];          // WMMA 的累加器用float类型
-
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-    wmma::fill_fragment(c_frag, 0.0f);
-
-    for (int k0 = 0; k0 < k; k0 += 32)
-    {
-        // 128线程装1024个元素，1个线程装8个元素
-        for (int i = btid; i < 1024; i += 128)
-        {
-            int r = i / 32;
-            int c = i % 32;
-            As[r][c] = A[(bm * 32 + r) * k + (k0 + c)];
-            Bs[r][c] = B[(k0 + r) * n + (bn * 32 + c)];
-        }
-        __syncthreads();
-
-        for (int kk = 0; kk < 32; kk += 16)
-        {
-            wmma::load_matrix_sync(a_frag, &As[warp_m * 16][kk], 32);
-            wmma::load_matrix_sync(b_frag, &Bs[kk][warp_n * 16], 32);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
-        __syncthreads();
-    }
-
-    wmma::store_matrix_sync(&Cf[warp_m * 16][warp_n * 16], c_frag, 32, wmma::mem_row_major);
-    __syncthreads();
-
-    for (int i = btid; i < 1024; i += 128)
-    {
-        int r = i / 32;
-        int c = i % 32;
-        C[(bm * 32 + r) * n + bn * 32 + c] = __float2half(Cf[r][c]);
-    }
-}
 
 // ----------------------------------------------------------------------------
 // 台阶 5a：装载向量化（uint4 = 16 B = 8 个 half）
@@ -184,6 +127,7 @@ __global__ void gemm_tc5a_kernel(const half* __restrict__ A,
 //   __pipeline_memcpy_async(dst_smem, src_global, 16)     // 发一个异步拷贝，立刻返回，数据在路上 ———— 直接 global -> shared，不过寄存器
 //   __pipeline_commit()                                   // 把"自上次 commit 以来发的所有 async copy"打成一个组 ———— 提交这一批拷贝
 //   __pipeline_wait_prior(1)                              // 等到"最多还剩 N 个组未完成"； n取1就是 等到“只剩 1 批没完成”
+//      wait_prior(1) 是"按 commit 顺序保留最新 1 组
 
 //   memcpy_async 是"发出去就返回"，不等数据到；wait_prior 才是真正的等待点，没有 wait_prior，读到的是还没搬完的垃圾
 // 并且用两块共享内存轮流接，让“搬下一块”和“算当前块”重叠。
@@ -310,32 +254,49 @@ __global__ void gemm_tc5c_kernel(const half* __restrict__ A,
     // 一共几个 k 块
     const int NB = k / 32;
 
-// 把第 blk 块异步搬进缓冲 buf，并单独 commit（= 一批）
+/*
+    定义一个宏，宏是文本替换，不是函数调用
+    blk 是"K 维的第几个 32 列块"
+    把第 blk 块异步搬进缓冲 buf，并单独 commit（= 一批）
+
+    blk 和 buf 是模板参数，ISSUE(0, 0)，替换时把 0、0 填进去
+    编译器看到的就是下面三行，把0和0带进去：
+        // ISSUE(0, 0) 展开后：
+        __pipeline_memcpy_async(&As[0][r][cvec * 8],
+                                &A[(bm * 32 + r) * k + 0 * 32 + cvec * 8], 16);
+        __pipeline_memcpy_async(&Bs[0][r][cvec * 8],
+                                &B[(0 * 32 + r) * n + bn * 32 + cvec * 8], 16);
+        __pipeline_commit();
+*/
 #define ISSUE(blk, buf)                                                              \
     __pipeline_memcpy_async(&As[buf][r][cvec * 8],                                   \
                             &A[(bm * 32 + r) * k + (blk) * 32 + cvec * 8], 16);      \
     __pipeline_memcpy_async(&Bs[buf][r][cvec * 8],                                   \
                             &B[((blk) * 32 + r) * n + bn * 32 + cvec * 8], 16);      \
-    __pipeline_commit();
+    __pipeline_commit();        // 把这 256 个 copy 打包成 1 组
+    // 宏的定义到这里就结束了，  \是续行符，含义是"这一行还没完，下一行还是同一个逻辑行"——最后一行已经完了，不需要再"续"
+    // 结束的这一行就不用加这个续行符了
 
-    // 序言：第 0、1 块先发出去（真正搬的时候不占计算时间）
-    ISSUE(0, 0)
+    // 第 0、1 块先发出去（真正搬的时候不占计算时间）
+    // 三级流水的目标是"算 i 时，i+1 和 i+2 都在飞"
+    ISSUE(0, 0)             // 搬 K 维第 0 块（k0=0）  到 buf 0
     if (NB > 1) {
-        ISSUE(1, 1)
+        ISSUE(1, 1)         // 搬 K 维第 1 块（k0=32） 到 buf 1
     }
 
     for (int i = 0; i < NB; ++i)
     {
-        int cur = i % 3;
+        // 本轮算哪个 buf
+        int cur = i % 3;    
 
         // 预取 i+2 那一块，放到 (i+2)%3 号缓冲
         if (i + 2 < NB) {
-            ISSUE(i + 2, (i + 2) % 3)
+            ISSUE(i + 2, (i + 2) % 3)           // (i+2)%3 = (i-1)%3， 是上一轮（i-1）用过的 buffer
         }
 
         // 还在飞、但用不到的批次：最多 2 个（i+1、i+2）；末尾会变少
-        int remain = NB - 1 - i;
-        int wait_n = remain < 2 ? remain : 2;
+        int remain = NB - 1 - i;                        // 当前 i 之后还剩多少块
+        int wait_n = remain < 2 ? remain : 2;           // 最多允许 2 组在飞
         __pipeline_wait_prior(wait_n);
         __syncthreads();
 
@@ -347,6 +308,7 @@ __global__ void gemm_tc5c_kernel(const half* __restrict__ A,
         }
         __syncthreads();
     }
+// 取消宏定义
 #undef ISSUE
 
     wmma::store_matrix_sync(&Cf[warp_m * 16][warp_n * 16], c_frag, 32, wmma::mem_row_major);
@@ -463,8 +425,6 @@ __global__ void gemm_tc6_kernel(const half* __restrict__ A,
     }
 }
 
-
-
 // ----------------------------------------------------------------------------
 // host
 // ----------------------------------------------------------------------------
@@ -484,6 +444,30 @@ __global__ void fill_kernel(half* p, int n, int mode)
         p[i] = (mode == 0) ? __float2half((float)(i % 37) * 0.01f - 0.18f)
                            : __float2half((float)(i % 53) * 0.013f - 0.34f);
     }
+}
+
+// ----------------------------------------------------------------------------
+// cuBLAS 对照：同一进程、同一 event、同一份数据，交替计时
+//
+// 注意 cuBLAS 是列主序。A 行主序 M×K == 列主序 K×M（lda=K）；
+// B 行主序 K×N == 列主序 N×K（lda=N）；于是
+//     C_cm(N×M) = B_cm(N×K) · A_cm(K×M)
+// 即调用时 m=N, n=M, k=K，两个矩阵指针顺序对调。
+// 本文件的比较基准只有 cuBLAS；台阶4 在 w6_gemm.cu 里，不参与本文件任何比较。
+// ----------------------------------------------------------------------------
+static cublasHandle_t g_handle = nullptr;
+
+void launch_cublas(const half* A, const half* B, half* C)
+{
+    float alpha = 1.f, beta = 0.f;
+    cublasGemmEx(g_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                 N, M, K,
+                 &alpha,
+                 B, CUDA_R_16F, N,      // B_cm: N×K, lda = N
+                 A, CUDA_R_16F, K,      // A_cm: K×M, ldb = K
+                 &beta,
+                 C, CUDA_R_16F, N,      // C_cm: N×M, ldc = N
+                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
 float bench(void (*launch)(const half*, const half*, half*), const half* dA,
@@ -539,42 +523,70 @@ int main()
     size_t bytesB = (size_t)K * N * sizeof(half);
     size_t bytesC = (size_t)M * N * sizeof(half);
 
-    half *dA, *dB, *dC0, *dC1;
+    half *dA, *dB, *dC0, *dC1, *dC2;
     CHECK(cudaMalloc(&dA, bytesA));
     CHECK(cudaMalloc(&dB, bytesB));
     CHECK(cudaMalloc(&dC0, bytesC));
     CHECK(cudaMalloc(&dC1, bytesC));
+    CHECK(cudaMalloc(&dC2, bytesC));
+    cublasCreate(&g_handle);
 
     int threads = 256;
     fill_kernel<<<(M * K + threads - 1) / threads, threads>>>(dA, M * K, 0);
     fill_kernel<<<(K * N + threads - 1) / threads, threads>>>(dB, K * N, 1);
     CHECK(cudaDeviceSynchronize());
 
-    launch_tc5b(dA, dB, dC0);
-    launch_tc6(dA, dB, dC1);
+    // 正确性：唯一参照是 cuBLAS（fp16 输出，容差 1e-2）
+    launch_cublas(dA, dB, dC2);
     CHECK(cudaDeviceSynchronize());
 
-    half* h0 = (half*)malloc(bytesC);
-    half* h1 = (half*)malloc(bytesC);
-    CHECK(cudaMemcpy(h0, dC0, bytesC, cudaMemcpyDeviceToHost));
-    CHECK(cudaMemcpy(h1, dC1, bytesC, cudaMemcpyDeviceToHost));
-    float max_abs = 0.f;
-    for (int i = 0; i < M * N; ++i) {
-        float d = fabsf(__half2float(h0[i]) - __half2float(h1[i]));
-        if (d > max_abs) max_abs = d;
+    void (*cand[4])(const half*, const half*, half*) = {launch_tc5a, launch_tc5b, launch_tc5c, launch_tc6};
+    half* bufs[4] = {dC0, dC0, dC1, dC1};
+    const char* names[4] = {"5a uint4", "5b cp.async x2", "5c cp.async x3", "6  64x64 tile"};
+
+    half* hcu = (half*)malloc(bytesC);
+    half* hout = (half*)malloc(bytesC);
+    CHECK(cudaMemcpy(hcu, dC2, bytesC, cudaMemcpyDeviceToHost));
+
+    printf("\n=== 正确性（对 cuBLAS，fp16 输出，1e-2） ===\n");
+    for (int i = 0; i < 4; ++i) {
+        cand[i](dA, dB, bufs[i]);
+        CHECK(cudaDeviceSynchronize());
+        CHECK(cudaMemcpy(hout, bufs[i], bytesC, cudaMemcpyDeviceToHost));
+        float mx = 0.f;
+        for (int j = 0; j < M * N; ++j) {
+            float d = fabsf(__half2float(hout[j]) - __half2float(hcu[j]));
+            if (d > mx) mx = d;
+        }
+        printf("max |%-16s - cuBLAS| = %.3e  %s\n", names[i], mx, mx < 1e-2f ? "[OK]" : "[WRONG]");
     }
-    printf("max |tc5b - tc6| = %.6e   %s\n", max_abs, max_abs < 1e-2f ? "[OK]" : "[WRONG]");
 
     const double FLOPS = 2.0 * M * N * K;
-    float ms0 = 1e30f, ms1 = 1e30f;
-    for (int round = 0; round < 3; ++round) {
-        float a = bench(launch_tc5b, dA, dB, dC0, 100, 1, 100);
-        float b = bench(launch_tc6, dA, dB, dC1, 100, 1, 100);
-        if (a < ms0) ms0 = a;
-        if (b < ms1) ms1 = b;
+    const double PEAK = 65.2;   // RTX 4060 Laptop fp16 Tensor Core 峰值 TFLOPS（实测 2655 MHz）
+    float best_cu = 1e30f, best[4] = {1e30f, 1e30f, 1e30f, 1e30f};
+
+    // 交替跑：同一时刻的频率/温度状态，避免“谁先跑谁吃亏”
+    for (int round = 0; round < 5; ++round) {
+        float cu = bench(launch_cublas, dA, dB, dC2, 100, 1, 100);
+        if (cu < best_cu) best_cu = cu;
+        for (int i = 0; i < 4; ++i) {
+            float v = bench(cand[i], dA, dB, bufs[i], 100, 1, 100);
+            if (v < best[i]) best[i] = v;
+        }
     }
-    printf("台阶5b（二级流水）     %8.4f ms   %6.2f TFLOPS\n", ms0, FLOPS / (ms0 * 1e-3) / 1e12);
-    printf("台阶6（64x64 tile）   %8.4f ms   %6.2f TFLOPS   %+.1f%%\n", ms1,
-           FLOPS / (ms1 * 1e-3) / 1e12, (ms0 / ms1 - 1.0f) * 100.0f);
+
+    printf("\n=== 性能（M=N=K=1024, fp16；min-of-5 轮 x 100 次） ===\n");
+    printf("%-16s %8s %8s %7s %8s\n", "实现", "ms", "TFLOPS", "%峰值", "%cuBLAS");
+    double tf_cu = FLOPS / (best_cu * 1e-3) / 1e12;
+    printf("%-16s %8.4f %8.2f %6.1f%% %7.1f%%\n", "cuBLAS fp16", best_cu, tf_cu,
+           tf_cu / PEAK * 100.0, 100.0);
+    for (int i = 0; i < 4; ++i) {
+        double tf = FLOPS / (best[i] * 1e-3) / 1e12;
+        printf("%-16s %8.4f %8.2f %6.1f%% %7.1f%%\n", names[i], best[i], tf,
+               tf / PEAK * 100.0, best_cu / best[i] * 100.0);
+    }
+    printf("\n注：%%cuBLAS = 我方达到 cuBLAS 的比例；1.52x 慢 ≈ 66%%\n");
+
+    cublasDestroy(g_handle);
     return 0;
 }

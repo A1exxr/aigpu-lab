@@ -45,7 +45,7 @@ python kernels/bench_kernels.py --only gelu --verbose-build
 | RMSNorm+残差（两 kernel） | 同上，`two_step_*` | 0.3756 ms | — | 268.0 GB/s（98.5%，6N 口径） | DRAM 91.4% / 65.1% |
 | Attention naive（3 kernel） | `kernels/w4_attn_naive.cu` | **15.53 ms**（首版 46.87） | 4.41 ms | 18.4 GB/s（6.8%） | 卡在 L1 扇区 + 指令发射，未到 DRAM（残余瓶颈需 tiling） |
 | FlashAttention（Triton） | `kernels/w5_flash_attn.py` | **0.474 ms** | 0.432 ms（SDPA） | 不适用，见下 | **18.1 TFLOPS（27.8% fp16 峰值）** → 比 naive 快 **32.8×**，达 SDPA 的 **91%** |
-| GEMM（四级台阶） | `kernels/w6_gemm.cu` | **0.2836 ms**（naive 2.42 → tiled 1.78 → 寄存器分块 0.66 → Tensor Core 0.28） | 0.3256 ms（fp32 matmul） | 不适用（compute-bound） | **7.57 TFLOPS（fp16 峰值 11.6%）→ 1.13× PyTorch fp32 matmul**；4b 放大到 64×64 tile 反而退到 0.383 ms |
+| GEMM（四级台阶） | `kernels/w6_gemm.cu` | **0.2836 ms**（naive 2.42 → tiled 1.78 → 寄存器分块 0.66 → Tensor Core 0.28） | 0.3256 ms（fp32 matmul） | 不适用（compute-bound） | **7.57 TFLOPS（fp16 峰值 11.6%）**；同二进制 cuBLAS fp16 为 0.0811 ms / 26.47 TFLOPS（差 3.50×）；4b 放大到 64×64 tile 反而退到 0.383 ms |
 | PagedAttention decode | `kernels/w8_paged_attn_int8.cu` | **1.0419 ms**（naive 2.36 → 单遍 1.89 → 2 路 1.51 → split-L 1.25 → **K 量化 1.04**） | 8.362 ms（显式循环 ref） | 194.4 GB/s（71.5% 标称 / **87.8% 实测量**） | memory-bound；INT8 只量化 K 才划算，V 也量化反而掉回 1.20 ms |
 
 > **口径说明**：`有效带宽 = 算法流量 ÷ 时间`，分母用 272 GB/s（标称）。
@@ -161,7 +161,7 @@ M=N=K=1024、fp16；参考实现是 PyTorch 的 **fp32** matmul（0.3256 ms / 6.
 | 1 naive | 每线程算 1 个 C 元素，直读全局内存 | 2.4207 ms | 0.89 TFLOPS | 0.11× | — |
 | 2 shared tiling | 32×32 tile 搬进共享内存，block 内复用 32 次 | 1.7840 ms | 1.20 TFLOPS | 0.15× | 全局内存流量降到 1/32 |
 | 3 寄存器分块 | block 8×8=64 线程，每线程算 4×4 个 C 元素 | 0.6574 ms | 3.27 TFLOPS | 0.49× | 共享内存读取摊薄 4 倍（每读服务 4 次 FMA） |
-| 4 Tensor Core | `wmma` 16×16×16，block 32×4=128 线程，C tile 32×32，fp32 累加后转 fp16 | **0.2836 ms** | **7.57 TFLOPS** | **1.13×** | 一次 mma 顶 4096 次 FMA，同时消掉 half2float 与 bank conflict |
+| 4 Tensor Core | `wmma` 16×16×16，block 32×4=128 线程，C tile 32×32，fp32 累加后转 fp16 | **0.2836 ms** | **7.57 TFLOPS** | — | 一次 mma 顶 4096 次 FMA，同时消掉 half2float 与 bank conflict |
 | 4b Tensor Core（反例） | 同上，C tile 放大到 64×64，block 32×16=512 线程 | 0.3830 ms | 5.61 TFLOPS | 0.84× | **负结果**，原因见下 |
 
 台阶 1–3 之间是 3.68× 的差距，每一步都能用流量账解释：naive 每算一个 C 元素要读 2·K 个元素
@@ -170,7 +170,7 @@ M=N=K=1024、fp16；参考实现是 PyTorch 的 **fp32** matmul（0.3256 ms / 6.
 
 **台阶 4 把台阶 3 的三个卡点一次解决**：`wmma::mma_sync` 一条指令完成 16×16×16 的乘加（等价 4096 次 FMA），
 直接吃 fp16 操作数（不再需要 8 次 `__half2float`），由硬件按 mma 布局取数（不再有 `As[ty*4+i][kk]` 的 4-way bank conflict），
-也不占 CUDA core 的发射槽。0.2836 ms 对应 fp16 峰值的 11.6%，是 PyTorch fp32 matmul 的 **1.13×**。
+也不占 CUDA core 的发射槽。0.2836 ms 对应 fp16 峰值的 11.6%；同二进制 cuBLAS fp16 为 0.0811 ms，差 3.50×。
 
 **台阶 4b 为什么反而慢 35%**：tile 从 32×32 放大到 64×64 确实提升了复用（算术强度 16→32），
 但共享内存从 4 KB 涨到 **24 KB**（`As[64][32]` + `Bs[32][64]` + `Cf[64][64]` 的 fp32 中转区），
@@ -383,12 +383,12 @@ ncu --clock-control none --set full -c 1 \
   从 0.580 ms 降到 0.474 ms；`num_warps=8` 会掉到 0.87 ms（每 warp 只剩 8 行，喂不饱 Tensor Core 的最小 mma 粒度）。
 - **FlashAttention 只支持 `head_dim ≤ 64`、无 causal mask**；再往上的收益需要 `p` 保持 fp32 的指令级优化与 split-K 并行。
 - **naive attention 的带宽利用率只有 6.8%**，不是测错：S² 矩阵要落显存四次往返，瓶颈在指令发射与 L1 扇区而非 HBM。它存在的意义是当 FlashAttention 的分母。
-- **GEMM 已用上 Tensor Core**：`wmma` 版本 0.2836 ms / 7.57 TFLOPS = PyTorch fp32 matmul 的 **1.13×**；
+- **GEMM 已用上 Tensor Core**：`wmma` 版本 0.2836 ms / 7.57 TFLOPS = fp16 峰值的 **11.6%**；
   台阶 4b（64×64 tile）反而慢 35%，原因是 24 KB 共享内存把每 SM 驻留 block 数从 12 压到 3、屏障无法被掩盖。
   这条负结果比正结果更能说明"tile 大小要与占用率一起算"。
-  **口径说明**：1.13× 的基线是 **fp32 matmul**。若基线换成 `torch.matmul`（fp16、走 Tensor Core），
-  按 7.57 TFLOPS 与 TC 理论值估算，本实现约为其 **0.2–0.4×**（未实测，仅估算）——
-  也就是说差距在 double buffering 与 swizzle，不在 mma 本身。
+  **口径说明**：本文所有 GEMM 对比均为**同精度、同一二进制内交替计时**（见 `docs/01-概念/09-性能口径.md`）。
+  同进程 cuBLAS fp16 为 0.090 ms / 23.8 TFLOPS：台阶4（0.2836 ms）差 3.15×，台阶6（三次 0.123 / 0.136 / 0.136，取中位 0.136 ms）差 1.51×（66%）。
+  不与 fp32 matmul 相比 —— 精度与计算单元都不同。
   **进行中（2026-10-31 起）**：64×64 tile + 每 warp 2×2 + swizzle → double buffering + `cp.async`，目标 ≤ 0.19 ms。
 - **bench 与 ncu 两把尺子差 40%，原因未定论**（已排除降频/入队/分配器），见上方口径说明。
 - **PagedAttention decode 最优是 INT8 只量化 K**（1.0419 ms，194.4 GB/s = 87.8% 实测带宽）；

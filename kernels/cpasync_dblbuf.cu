@@ -124,6 +124,8 @@ __global__ void sum_cp_async(const float* __restrict__ in, float* out, int nchun
         // 循环只管拷贝，其他三行在外面
         // __pipeline_* 的队列是每个线程私有的，不是每个 block 共享的
         // memcpy_async = 往“我的队列”里塞一条拷贝
+        // 所以这里是每个线程都去搬自己的4个float，16字节
+        // 参1：目标地址；参2：源地址；参3：从源地址开始，要搬运的字节数，同时指定对齐要求
         __pipeline_memcpy_async(&buf[0][i], &in[i], 16);    // 一次异步拷贝4个float
     }
     __pipeline_commit();                // commit = 把“我目前塞进去的这些”封成一组；
