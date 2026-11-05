@@ -56,7 +56,9 @@ kernels/
 | `w3_fused_rmsnorm_residual.cu` | 完成 | 融合版 199.9 µs / ncu DRAM 92.8%，比两 kernel 版快 1.95× |
 | `w4_attn_naive.cu` | 完成 | 46.87 → **15.53 ms**（warp-per-j + PV 四路切分 + QK ILP-4） |
 | `w5_flash_attn.py` | 完成 | **0.474 ms**，达 PyTorch SDPA 的 91%，naive 的 1/32.8 |
-| `w6_gemm.cu` | **台阶 1–4 完成** | 2.42 → 1.78 → 0.657 → **0.2836 ms**（Tensor Core），超 PyTorch fp32 基线 1.13×；64×64 tile 反例更慢（0.3758） |
+| `w6_gemm.cu` | **台阶 1–4 完成** | 2.42 → 1.78 → 0.657 → **0.2836 ms**（Tensor Core，7.57 TFLOPS = fp16 峰值 11.6%）；同尺寸 cuBLAS fp16 0.1219 ms（差 **2.33×**）、cuBLAS fp32 0.2889 ms（1.02×，**持平**）；64×64 tile 反例更慢（0.3830） |
+| `w6_1gemm.cu` | **台阶 5a 完成** | 装载向量化 uint4（每线程 8 条 LDG.16 → 1 条 LDG.128）：**0.2225 ms / 9.65 TFLOPS**，相对台阶4 **1.27×**；校验与基线逐位相同 |
+| `w6_2gemm.cu` | **台阶 5b 完成**（当前最优） | cp.async + 双缓冲（16 B 直搬 smem，绕开寄存器；`wait_prior(1)` 保留下一块在飞）：**0.1754 ms / 12.25 TFLOPS**，相对 5a **1.27×**、相对台阶4 **1.62×**；距 cuBLAS fp16 缩到 **1.44×**；三次 0.1754 / 0.1759 / 0.2005 |
 | `w9_softmax_backward.cu` | 完成 | **0.2601 ms**，193.5 GB/s = 71.1%（标称）/ **87.4%（实测天花板）**；一次行内归约 + 寄存器驻留（3N 而非 5N），vs torch 表达式参考 8.13× |
 | `w10_layernorm_backward.cu` | 台阶1 完成（只算 dx） | **0.2980 ms**，168.9 GB/s = 62.1%（标称）/ **81.8%（实测天花板）**；4 次行内归约（Σx / Σx² / Σγdy / Σγdyx̂），x̂ 提前算使读写止于 3N；ncu：277.9 µs / 48 reg / 81.2% 占用 / DRAM 80.6%；dγ/dβ 的跨行归约留台阶2 |
 | `w6_gemm.cu` 变体（NT / TN） | 完成（对照） | NT **0.2867 ms**（≈NN，B 沿 K 连续）；TN **0.3820 ms**（A 存成 `[K,M]`，读端 `col_major` 按 `k*32` 跳，付 33% bank 冲突代价）；分别对应反向里的 `dA = dY·Bᵀ` 与 `dW = dYᵀ·X` |
