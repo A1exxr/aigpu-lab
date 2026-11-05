@@ -45,7 +45,7 @@ python kernels/bench_kernels.py --only gelu --verbose-build
 | RMSNorm+残差（两 kernel） | 同上，`two_step_*` | 0.3756 ms | — | 268.0 GB/s（98.5%，6N 口径） | DRAM 91.4% / 65.1% |
 | Attention naive（3 kernel） | `kernels/w4_attn_naive.cu` | **15.53 ms**（首版 46.87） | 4.41 ms | 18.4 GB/s（6.8%） | 卡在 L1 扇区 + 指令发射，未到 DRAM（残余瓶颈需 tiling） |
 | FlashAttention（Triton） | `kernels/w5_flash_attn.py` | **0.474 ms** | 0.432 ms（SDPA） | 不适用，见下 | **18.1 TFLOPS（27.8% fp16 峰值）** → 比 naive 快 **32.8×**，达 SDPA 的 **91%** |
-| GEMM（四级台阶） | `kernels/w6_gemm.cu` | **0.2836 ms**（naive 2.42 → tiled 1.78 → 寄存器分块 0.66 → Tensor Core 0.28） | 0.3256 ms（fp32 matmul） | 不适用（compute-bound） | **7.57 TFLOPS（fp16 峰值 11.6%）**；同二进制 cuBLAS fp16 为 0.0811 ms / 26.47 TFLOPS（差 3.50×）；4b 放大到 64×64 tile 反而退到 0.383 ms |
+| GEMM（六级台阶） | `kernels/w6_gemm.cu` + `w6_2gemm.cu` | **0.1010 ms**（naive 2.42 → tiling 1.78 → 寄存器 4×4 0.657 → wmma 0.284 → uint4 0.2025 → cp.async 0.176 → 64×64 tile + 跨度补齐 **0.101**） | 不适用（fp32 matmul 0.3256 ms 是另一精度） | 不适用（compute-bound） | **21.3 TFLOPS（fp16 峰值 32.6%）**；同进程 cuBLAS fp16 0.0834 ms / 25.8 TFLOPS（差 1.21×，达 83%）；naive→最优 **24.0×** |
 | PagedAttention decode | `kernels/w8_paged_attn_int8.cu` | **1.0419 ms**（naive 2.36 → 单遍 1.89 → 2 路 1.51 → split-L 1.25 → **K 量化 1.04**） | 8.362 ms（显式循环 ref） | 194.4 GB/s（71.5% 标称 / **87.8% 实测量**） | memory-bound；INT8 只量化 K 才划算，V 也量化反而掉回 1.20 ms |
 
 > **口径说明**：`有效带宽 = 算法流量 ÷ 时间`，分母用 272 GB/s（标称）。
@@ -152,9 +152,9 @@ split-L 把每段 L 交给一个独立 warp，grid 从 32 涨到 128（5.33 bloc
 
 ---
 
-### GEMM 四级台阶：2.42 ms → 1.78 ms → 0.657 ms → 0.284 ms
+### GEMM 六级台阶：2.42 → 1.78 → 0.657 → 0.284 → 0.2025 → 0.176 → 0.1010 ms
 
-M=N=K=1024、fp16；参考实现是 PyTorch 的 **fp32** matmul（0.3256 ms / 6.59 TFLOPS）。
+M=N=K=1024、fp16；基准是**同一二进制内交替计时**的同进程 cuBLAS fp16（0.0834 ms / 25.8 TFLOPS）。PyTorch 的 fp32 matmul（0.3256 ms）是另一种精度，不参与对比。
 
 | 台阶 | 做法 | 时间 | 算力 | 对基线 | 解决了什么 |
 |---|---|---|---|---|---|
@@ -162,7 +162,11 @@ M=N=K=1024、fp16；参考实现是 PyTorch 的 **fp32** matmul（0.3256 ms / 6.
 | 2 shared tiling | 32×32 tile 搬进共享内存，block 内复用 32 次 | 1.7840 ms | 1.20 TFLOPS | 0.15× | 全局内存流量降到 1/32 |
 | 3 寄存器分块 | block 8×8=64 线程，每线程算 4×4 个 C 元素 | 0.6574 ms | 3.27 TFLOPS | 0.49× | 共享内存读取摊薄 4 倍（每读服务 4 次 FMA） |
 | 4 Tensor Core | `wmma` 16×16×16，block 32×4=128 线程，C tile 32×32，fp32 累加后转 fp16 | **0.2836 ms** | **7.57 TFLOPS** | — | 一次 mma 顶 4096 次 FMA，同时消掉 half2float 与 bank conflict |
-| 4b Tensor Core（反例） | 同上，C tile 放大到 64×64，block 32×16=512 线程 | 0.3830 ms | 5.61 TFLOPS | 0.84× | **负结果**，原因见下 |
+| 4b Tensor Core（反例） | 同上，C tile 放大到 64×64，block 32×16=512 线程 | 0.3830 ms | 5.61 TFLOPS | 0.84× | **负结果**：只放大 tile、没配 `cp.async` 与跨度补齐，原因见下 |
+| 5a uint4 装载 | 台阶4 + 16 B 向量装载（`uint4`），省掉逐元素 `__half2float` | 0.2025 ms | 10.60 TFLOPS | — | 装载指令数 8→1，字节数不变 |
+| 5b cp.async 双缓冲 | `__pipeline_memcpy_async` + 双缓冲，搬运与计算重叠 | 0.1763 ms | 12.18 TFLOPS | — | 消掉 `ld.global → st.shared` 的写后依赖（同条件玩具实验 0.716 → 0.204 ms，3.5×） |
+| 5c cp.async 三级 | 同上再加一级缓冲 | 0.1765 ms | 12.17 TFLOPS | — | **无收益**：共享内存 12→16 KB，驻留 block 减少抵消了流水收益 |
+| 6 64×64 tile + 跨度补齐 | 每 warp 算 32×32（2×2 fragment）+ `As[64][40]`/`Bs[32][72]`/`Cf[64][68]` | **0.1010 ms** | **21.27 TFLOPS** | **83%** | smem 复用 4 倍 + 行跨度各 +4 bank，打散 `load_matrix_sync` 的 bank 冲突 |
 
 台阶 1–3 之间是 3.68× 的差距，每一步都能用流量账解释：naive 每算一个 C 元素要读 2·K 个元素
 （2.147 G 次读取 ≈ 4.29 GB），tiling 把它压到 1/32；寄存器分块则摊薄共享内存读取——tiled 每算一个 C 元素要
@@ -170,15 +174,26 @@ M=N=K=1024、fp16；参考实现是 PyTorch 的 **fp32** matmul（0.3256 ms / 6.
 
 **台阶 4 把台阶 3 的三个卡点一次解决**：`wmma::mma_sync` 一条指令完成 16×16×16 的乘加（等价 4096 次 FMA），
 直接吃 fp16 操作数（不再需要 8 次 `__half2float`），由硬件按 mma 布局取数（不再有 `As[ty*4+i][kk]` 的 4-way bank conflict），
-也不占 CUDA core 的发射槽。0.2836 ms 对应 fp16 峰值的 11.6%；同二进制 cuBLAS fp16 为 0.0811 ms，差 3.50×。
+也不占 CUDA core 的发射槽。0.2836 ms 对应 fp16 峰值的 11.6%；同进程 cuBLAS fp16 为 0.0834 ms，差 3.40×。
 
 **台阶 4b 为什么反而慢 35%**：tile 从 32×32 放大到 64×64 确实提升了复用（算术强度 16→32），
 但共享内存从 4 KB 涨到 **24 KB**（`As[64][32]` + `Bs[32][64]` + `Cf[64][64]` 的 fp32 中转区），
 于是每 SM 能驻留的 block 数从 **12 掉到 3**（1536 线程/SM ÷ 512 线程/block，且 24 KB×4 已超共享内存容量）。
 每 SM 的 warp 总数没变（都是 48），但**并发 block 少了 4 倍**：一个 block 撞 `__syncthreads` 时，没有足够的其他 block 来填计算空档，
 而这一版循环每阶段只有 2 次 `mma_sync` 却要付 2 次屏障。
-结论不是"tile 越大越好"，而是 **tile 大小必须和每 SM 的驻留能力一起算**；真正的大 tile（128×128）要配 8 warp 和双缓冲流水（`cp.async`），
-那是 cuBLAS 量级的工程，已超出本项目范围。
+结论不是"tile 越大越好"，而是 **tile 大小必须和每 SM 的驻留能力、以及流水方式一起算**。
+
+**台阶 5 改的是"怎么搬"**：台阶 4 每线程搬 8 个 half 再逐元素 `__half2float`，装载指令吃满发射槽。
+5a 换成 `uint4`（一次 16 B）后装载指令 8→1；5b 再把 `ld.global → st.shared` 换成 `cp.async`，让搬运与计算重叠。
+这条用同条件玩具实验拆开过（同样 4 MB 数据、同样块数，只改拷贝方式）：
+单缓冲 **0.716 ms**、普通双缓冲 **0.700 ms（0.98×，白做）**、`cp.async` 双缓冲 **0.204 ms（3.5×）**——
+**换顺序没用，换指令才有用**，因为瓶颈是"写共享内存前的依赖"把 warp 卡住。5c 加第三级缓冲没有收益。
+
+**台阶 6 才是 64×64 的正确打开方式**：4b 只放大了 tile，台阶 6 补上两件事——
+（1）`cp.async` 双缓冲；（2）三个共享内存数组的行跨度各加 4 个 bank（`As[64][40]`、`Bs[32][72]`、`Cf[64][68]`）。
+第二条是关键：`Bs` 原本行跨度 64 half = 128 B = 32 个 bank 一整圈，16 行会轮流撞同一组 bank；补齐到 144 B 后打散。
+0.136 → **0.1010 ms**，达同进程 cuBLAS fp16 的 **83%**、fp16 峰值的 32.6%，naive→最优 **24.0×**。
+剩下那 1.21× 来自 `wmma` 高层封装（无 `ldmatrix`、无 swizzle、无手写 `mma.sync`），本项目不做。
 
 ### PagedAttention decode：2.36 ms → 1.04 ms（2.26×，INT8 只量化 K 才划算）
 
@@ -318,7 +333,8 @@ ncu 用法与"怎么判瓶颈"记在 [`docs/01-概念/03-ncu速查.md`](docs/01-
 │   ├── w3_fused_rmsnorm_residual.cu  融合版 + 两 kernel 对照
 │   ├── w4_attn_naive.cu         naive attention（QKᵀ / softmax / PV 三个 kernel）
 │   ├── w5_flash_attn.py         FlashAttention（Triton，online softmax；D≤64、无 causal）
-│   ├── w6_gemm.cu               GEMM 四级台阶（naive / tiling / 4×4 寄存器分块 / wmma Tensor Core）
+│   ├── w6_gemm.cu               GEMM 台阶 1–4（naive / tiling / 4×4 寄存器分块 / wmma Tensor Core）
+│   ├── w6_2gemm.cu              GEMM 台阶 5–6 + 同进程 cuBLAS 基准（0.1010 ms，83%）
 │   ├── w7_paged_attn_split.cu   PagedAttention decode split-L（1.2483 ms，97.6% 实测带宽）
 │   ├── w7_paged_attn.cu         单链 2 路展开版（1.5084 ms）
 │   ├── w8_paged_attn_int8.cu    INT8 只量化 K（1.0419 ms，本项目最优）
@@ -383,13 +399,14 @@ ncu --clock-control none --set full -c 1 \
   从 0.580 ms 降到 0.474 ms；`num_warps=8` 会掉到 0.87 ms（每 warp 只剩 8 行，喂不饱 Tensor Core 的最小 mma 粒度）。
 - **FlashAttention 只支持 `head_dim ≤ 64`、无 causal mask**；再往上的收益需要 `p` 保持 fp32 的指令级优化与 split-K 并行。
 - **naive attention 的带宽利用率只有 6.8%**，不是测错：S² 矩阵要落显存四次往返，瓶颈在指令发射与 L1 扇区而非 HBM。它存在的意义是当 FlashAttention 的分母。
-- **GEMM 已用上 Tensor Core**：`wmma` 版本 0.2836 ms / 7.57 TFLOPS = fp16 峰值的 **11.6%**；
-  台阶 4b（64×64 tile）反而慢 35%，原因是 24 KB 共享内存把每 SM 驻留 block 数从 12 压到 3、屏障无法被掩盖。
-  这条负结果比正结果更能说明"tile 大小要与占用率一起算"。
+- **GEMM 已用上 Tensor Core**：台阶6（64×64 tile + `cp.async` 双缓冲 + 共享内存跨度补齐）
+  **0.1010 ms / 21.27 TFLOPS = fp16 峰值的 32.6%**，同进程 cuBLAS fp16 的 **83%**，naive→最优 **24.0×**；
+  推不上去的原因是没手写 `mma.sync` / `ldmatrix` / swizzle（`wmma` 封装有额外搬运）。
+  台阶 4b 的负结果（64×64 但无 `cp.async` 与跨度补齐 → 0.383 ms）说明"tile 大小要与占用率、流水一起算"。
   **口径说明**：本文所有 GEMM 对比均为**同精度、同一二进制内交替计时**（见 `docs/01-概念/09-性能口径.md`）。
-  同进程 cuBLAS fp16 为 0.090 ms / 23.8 TFLOPS：台阶4（0.2836 ms）差 3.15×，台阶6（三次 0.123 / 0.136 / 0.136，取中位 0.136 ms）差 1.51×（66%）。
+  同进程 cuBLAS fp16 为 0.0834 ms / 25.8 TFLOPS：台阶4（0.2836 ms）差 3.40×，台阶6（0.1010 ms / 21.3 TFLOPS / 32.6% 峰值）差 1.21×（83%）。
   不与 fp32 matmul 相比 —— 精度与计算单元都不同。
-  **进行中（2026-10-31 起）**：64×64 tile + 每 warp 2×2 + swizzle → double buffering + `cp.async`，目标 ≤ 0.19 ms。
+  **下一步（未做）**：warp 4→8 或改手写 `mma.sync` + `ldmatrix`，预期 0.09~0.10 ms；当前 0.101 ms 已收手。
 - **bench 与 ncu 两把尺子差 40%，原因未定论**（已排除降频/入队/分配器），见上方口径说明。
 - **PagedAttention decode 最优是 INT8 只量化 K**（1.0419 ms，194.4 GB/s = 87.8% 实测带宽）；
   fp16 版是 1.2483 ms / 97.6%。量化把流量从 256 降到 193 MiB，但窄流也把利用率拉低了 10 个点。
