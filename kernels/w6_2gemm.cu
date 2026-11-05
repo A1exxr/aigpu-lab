@@ -271,6 +271,201 @@ __global__ void gemm_tc5b_kernel(const half* __restrict__ A,
 }
 
 // ----------------------------------------------------------------------------
+// 台阶 5c：三级流水（As[3] / Bs[3]）
+//
+// 5b 是两级：算当前、搬下一块 —— 只有 1 块在路上。
+// 5c 是三级：算当前、搬下一块、再下一块也已经发出去了 —— 2 块在路上。
+//
+// 唯一的难点：__pipeline_wait_prior(N) 里的 N 必须等于「此刻还在飞、但已经用不到的批次数」。
+// 循环里最多是 2（i+1、i+2 两块），但最后两轮没有那么多可预取，N 要退化成 1、0。
+//   写成固定 2 -> 最后几轮会等到“永久不属于任何块”的批次，卡死或读错
+//   写成固定 0 -> 每轮全等，退化回同步
+// ----------------------------------------------------------------------------
+__global__ void gemm_tc5c_kernel(const half* __restrict__ A,
+                                 const half* __restrict__ B,
+                                 half* __restrict__ C,
+                                 int m, int k, int n)
+{
+    int tx   = threadIdx.x;
+    int ty   = threadIdx.y;
+    int btid = ty * 32 + tx;
+
+    int warp_m = ty / 2;
+    int warp_n = ty % 2;
+    int bm = blockIdx.y;
+    int bn = blockIdx.x;
+
+    __shared__ __align__(16) half As[3][32][32];
+    __shared__ __align__(16) half Bs[3][32][32];
+    __shared__ float Cf[32][32];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    int r    = btid / 4;
+    int cvec = btid % 4;
+
+    // 一共几个 k 块
+    const int NB = k / 32;
+
+// 把第 blk 块异步搬进缓冲 buf，并单独 commit（= 一批）
+#define ISSUE(blk, buf)                                                              \
+    __pipeline_memcpy_async(&As[buf][r][cvec * 8],                                   \
+                            &A[(bm * 32 + r) * k + (blk) * 32 + cvec * 8], 16);      \
+    __pipeline_memcpy_async(&Bs[buf][r][cvec * 8],                                   \
+                            &B[((blk) * 32 + r) * n + bn * 32 + cvec * 8], 16);      \
+    __pipeline_commit();
+
+    // 序言：第 0、1 块先发出去（真正搬的时候不占计算时间）
+    ISSUE(0, 0)
+    if (NB > 1) {
+        ISSUE(1, 1)
+    }
+
+    for (int i = 0; i < NB; ++i)
+    {
+        int cur = i % 3;
+
+        // 预取 i+2 那一块，放到 (i+2)%3 号缓冲
+        if (i + 2 < NB) {
+            ISSUE(i + 2, (i + 2) % 3)
+        }
+
+        // 还在飞、但用不到的批次：最多 2 个（i+1、i+2）；末尾会变少
+        int remain = NB - 1 - i;
+        int wait_n = remain < 2 ? remain : 2;
+        __pipeline_wait_prior(wait_n);
+        __syncthreads();
+
+        for (int kk = 0; kk < 32; kk += 16)
+        {
+            wmma::load_matrix_sync(a_frag, &As[cur][warp_m * 16][kk], 32);
+            wmma::load_matrix_sync(b_frag, &Bs[cur][kk][warp_n * 16], 32);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+        __syncthreads();
+    }
+#undef ISSUE
+
+    wmma::store_matrix_sync(&Cf[warp_m * 16][warp_n * 16], c_frag, 32, wmma::mem_row_major);
+    __syncthreads();
+
+    for (int idx2 = btid; idx2 < 1024; idx2 += 128)
+    {
+        int rr = idx2 / 32;
+        int cc = idx2 % 32;
+        C[(bm * 32 + rr) * n + bn * 32 + cc] = __float2half(Cf[rr][cc]);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// 台阶 6：C tile 64×64，每 warp 算 32×32（4 个 16×16 fragment）
+//
+// 与台阶5b（C tile 32×32，每 warp 16×16）的差别只有两处：
+//   ① tile 大 4 倍 → K 循环里每装一块 A/B，能算的 C 元素多 4 倍（smem 复用率翻倍）
+//   ② 每个 warp 持有 4 个累加器 → 4 次 mma 摊 2 次 load（a/b 各 2 次）
+//
+// smem：As[2][64][32] + Bs[2][32][64] = 16 KB（双缓冲）
+// 线程：block(32,4) = 128 = 4 warp，warp 布局 2×2，每 warp 管 32×32
+// 直写全局，不再用 Cf 中转（省 16 KB，否则只有 3 个 block 能驻留）
+// ----------------------------------------------------------------------------
+#define TILE6 64
+
+__global__ void gemm_tc6_kernel(const half* __restrict__ A,
+                                const half* __restrict__ B,
+                                half* __restrict__ C,
+                                int m, int k, int n)
+{
+    int tx   = threadIdx.x;
+    int ty   = threadIdx.y;
+    int btid = ty * 32 + tx;
+
+    int warp_m = ty / 2;      // 0..1
+    int warp_n = ty % 2;      // 0..1
+    int bm = blockIdx.y;      // 行块号（M 方向）
+    int bn = blockIdx.x;      // 列块号（N 方向）
+
+    __shared__ __align__(16) half As[2][TILE6][32];
+    __shared__ __align__(16) half Bs[2][32][TILE6];
+    // float 累加器只能 store 到 float*，所以需要一个 float 中转区（16 KB）
+    __shared__ __align__(16) float Cf[TILE6][TILE6];
+
+    // 每个 warp：a 两片、b 两片、c 四个
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag[2];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag[2];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[4];
+    for (int i = 0; i < 4; ++i) {
+        wmma::fill_fragment(c_frag[i], 0.0f);
+    }
+
+    const int NB = k / 32;    // k 方向的块数
+
+// 把第 blk 个 k 块搬进缓冲 buf。每线程每次搬 8 个 half = 16 B，
+// A tile 有 64×32/8 = 256 块 → 128 线程搬 2 轮；B tile 32×64 同理。
+#define LOAD6(blk, buf)                                                             \
+    for (int t = 0; t < 2; ++t) {                                                   \
+        int ch = t * 128 + btid;                                                    \
+        int ra = ch / 4, ca = (ch % 4) * 8;                                         \
+        __pipeline_memcpy_async(&As[buf][ra][ca],                                   \
+                                &A[(bm * TILE6 + ra) * k + (blk) * 32 + ca], 16);   \
+        int rb = ch / 8, cb = (ch % 8) * 8;                                         \
+        __pipeline_memcpy_async(&Bs[buf][rb][cb],                                   \
+                                &B[((blk) * 32 + rb) * n + bn * TILE6 + cb], 16);   \
+    }                                                                               \
+    __pipeline_commit();
+
+    LOAD6(0, 0)
+
+    for (int i = 0; i < NB; ++i)
+    {
+        int cur = i % 2;
+
+        if (i + 1 < NB) {
+            LOAD6(i + 1, (i + 1) % 2)
+        }
+
+        int remain = NB - 1 - i;
+        __pipeline_wait_prior(remain < 1 ? 0 : 1);
+        __syncthreads();
+
+        for (int kk = 0; kk < 32; kk += 16)
+        {
+            // 一次装 2 片 a、2 片 b，然后做 4 次 mma（这就是复用率的来源）
+            wmma::load_matrix_sync(a_frag[0], &As[cur][warp_m * 32 + 0][kk], 32);
+            wmma::load_matrix_sync(a_frag[1], &As[cur][warp_m * 32 + 16][kk], 32);
+            wmma::load_matrix_sync(b_frag[0], &Bs[cur][kk][warp_n * 32 + 0], TILE6);
+            wmma::load_matrix_sync(b_frag[1], &Bs[cur][kk][warp_n * 32 + 16], TILE6);
+            for (int ii = 0; ii < 2; ++ii) {
+                for (int jj = 0; jj < 2; ++jj) {
+                    wmma::mma_sync(c_frag[ii * 2 + jj], a_frag[ii], b_frag[jj], c_frag[ii * 2 + jj]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#undef LOAD6
+
+    // 先落到 smem 的 Cf（float），再统一转 half 写回全局
+    for (int ii = 0; ii < 2; ++ii) {
+        for (int jj = 0; jj < 2; ++jj) {
+            float* pdst = &Cf[warp_m * 32 + ii * 16][warp_n * 32 + jj * 16];
+            wmma::store_matrix_sync(pdst, c_frag[ii * 2 + jj], TILE6, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+
+    for (int idx = btid; idx < TILE6 * TILE6; idx += 128) {
+        int rr = idx / TILE6;
+        int cc = idx % TILE6;
+        C[(size_t)(bm * TILE6 + rr) * n + bn * TILE6 + cc] = __float2half(Cf[rr][cc]);
+    }
+}
+
+
+
+// ----------------------------------------------------------------------------
 // host
 // ----------------------------------------------------------------------------
 #define CHECK(x)                                                                          \
@@ -327,6 +522,16 @@ void launch_tc5b(const half* A, const half* B, half* C)
 {
     gemm_tc5b_kernel<<<GRID, BLOCK>>>(A, B, C, M, K, N);
 }
+void launch_tc5c(const half* A, const half* B, half* C)
+{
+    gemm_tc5c_kernel<<<GRID, BLOCK>>>(A, B, C, M, K, N);
+}
+// 台阶6 的 grid 是 64×64 一块，所以比 GRID 少一半
+void launch_tc6(const half* A, const half* B, half* C)
+{
+    dim3 grid6(N / TILE6, M / TILE6);
+    gemm_tc6_kernel<<<grid6, BLOCK>>>(A, B, C, M, K, N);
+}
 
 int main()
 {
@@ -345,8 +550,8 @@ int main()
     fill_kernel<<<(K * N + threads - 1) / threads, threads>>>(dB, K * N, 1);
     CHECK(cudaDeviceSynchronize());
 
-    launch_tc5a(dA, dB, dC0);
-    launch_tc5b(dA, dB, dC1);
+    launch_tc5b(dA, dB, dC0);
+    launch_tc6(dA, dB, dC1);
     CHECK(cudaDeviceSynchronize());
 
     half* h0 = (half*)malloc(bytesC);
@@ -358,18 +563,18 @@ int main()
         float d = fabsf(__half2float(h0[i]) - __half2float(h1[i]));
         if (d > max_abs) max_abs = d;
     }
-    printf("max |tc5a - tc5b| = %.6e   %s\n", max_abs, max_abs < 1e-2f ? "[OK]" : "[WRONG]");
+    printf("max |tc5b - tc6| = %.6e   %s\n", max_abs, max_abs < 1e-2f ? "[OK]" : "[WRONG]");
 
     const double FLOPS = 2.0 * M * N * K;
     float ms0 = 1e30f, ms1 = 1e30f;
     for (int round = 0; round < 3; ++round) {
-        float a = bench(launch_tc5a, dA, dB, dC0, 100, 1, 100);
-        float b = bench(launch_tc5b, dA, dB, dC1, 100, 1, 100);
+        float a = bench(launch_tc5b, dA, dB, dC0, 100, 1, 100);
+        float b = bench(launch_tc6, dA, dB, dC1, 100, 1, 100);
         if (a < ms0) ms0 = a;
         if (b < ms1) ms1 = b;
     }
-    printf("台阶5a（uint4 同步）   %8.4f ms   %6.2f TFLOPS\n", ms0, FLOPS / (ms0 * 1e-3) / 1e12);
-    printf("台阶5b（cp.async 双缓）%8.4f ms   %6.2f TFLOPS   %+.1f%%\n", ms1,
+    printf("台阶5b（二级流水）     %8.4f ms   %6.2f TFLOPS\n", ms0, FLOPS / (ms0 * 1e-3) / 1e12);
+    printf("台阶6（64x64 tile）   %8.4f ms   %6.2f TFLOPS   %+.1f%%\n", ms1,
            FLOPS / (ms1 * 1e-3) / 1e12, (ms0 / ms1 - 1.0f) * 100.0f);
     return 0;
 }
