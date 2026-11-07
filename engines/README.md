@@ -19,7 +19,7 @@ bench 里这些是 `torch.randn` 造的假数据；真实系统里，`block_tabl
 | 台阶 | 内容 | 判据 | 状态 |
 |---|---|---|---|
 | **M1** | 纯 PyTorch 手写 greedy 循环（每步重算整段） | 20 token 与 HF `generate` **逐位一致** | ✅ 已通过 |
-| M2 | 手写 KV cache（不再重算历史） | 同上逐位一致 + 每步耗时随 S **不再线性增长** | 待做 |
+| **M2** | 手写 KV cache（不再重算历史） | 同上逐位一致 + 每步耗时随 S **不再线性增长** | ✅ 已通过 |
 | M3 | 接 `paged_attn_split`（分页 KV + 自己的 kernel） | 同上逐位一致 + 吞吐对比 M2 | 待做 |
 
 ## 怎么跑
@@ -33,6 +33,9 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 # 已下过：跳过联网检查，秒起
 HF_HUB_OFFLINE=1 ~/miniconda3/envs/triton/bin/python engines/m1_naive.py
+
+# M2：5 轮交替测量（丢首次 + 剔 >2× 中位 + 中位数）
+HF_HUB_OFFLINE=1 ~/miniconda3/envs/triton/bin/python engines/m2_kvcache_bench.py
 ```
 
 依赖：`transformers`、`torch`（conda env `triton` 里已装）。
@@ -50,6 +53,33 @@ HF     : （完全一致）
 
 关键观察：**每步越来越慢**——第 1 步 S=6，第 20 步 S=26，因为每步都把整段重新 forward，
 累计做功 O(S²)。这就是 M2 用 KV cache 要消掉的浪费。
+
+## M2 的实测结果（gpt2 124M，fp32，batch=1）
+
+```
+prompt S = 441；每轮 重算 20 步 → 增量 20 步，共 5 轮交替
+逐位一致: True（5 轮全部相同）
+
+                  中位数        范围
+重算 20 步总耗时   355.03 ms     351.40–367.17
+增量 20 步总耗时   110.08 ms     105.11–123.62   → 3.23x
+重算 稳态单步       18.57 ms      17.32–19.04
+增量 稳态单步        4.89 ms       4.44– 5.86   → 3.79x
+
+峰值显存 704.5 MB
+```
+
+两条结论：
+
+1. **稳态单步 3.79×**：KV cache 消掉的是"每步重算整个前缀"，所以越到后面越省；
+   S 越大省得越多，这是 M3 上分页的动机。
+2. **总耗时只有 3.23×**：因为第 1 步要吃完整 prompt（prefill），两条路径都省不掉；
+   20 步太短，摊不薄 prefill。**对外分别报稳态和总耗时两个数，不要混用。**
+
+测量协议（可复现）：交替测 A/B（机器频率与温度漂移对两边公平）→ 丢弃第 1 轮冷启动
+（第一次走 `use_cache=True` 要建 cache、扩分配器，实测是 110 ms 的 15 倍）→ 剔除
+偏离中位数 2 倍以上的样本 → 取中位数。脚本 `m2_kvcache_bench.py` 自带这些步骤，
+并每轮 `assert` 两种实现输出逐位相同。
 
 ## 符号表（全项目统一，与 `kernels/` 的 CUDA 代码一致）
 
