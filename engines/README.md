@@ -20,7 +20,9 @@ bench 里这些是 `torch.randn` 造的假数据；真实系统里，`block_tabl
 |---|---|---|---|
 | **M1** | 纯 PyTorch 手写 greedy 循环（每步重算整段） | 20 token 与 HF `generate` **逐位一致** | ✅ 已通过 |
 | **M2** | 手写 KV cache（不再重算历史） | 同上逐位一致 + 每步耗时随 S **不再线性增长** | ✅ 已通过 |
-| M3 | 接 `paged_attn_split`（分页 KV + 自己的 kernel） | 同上逐位一致 + 吞吐对比 M2 | 待做 |
+| **M3a** | 分页 KV 池 + block_table（attention 仍由 HF 算） | 8 步 × 12 层 K/V 与 HF **逐位一致** | ✅ 已通过 |
+| **M3b-1** | cache 全自己管：池取 K/V + 自己算 attention（仍是 PyTorch） | 8 步 greedy token 与 M2 **完全一致** | ✅ 已通过 |
+| M3b-2 | 把 SDPA 换成 `paged_attn_split` kernel（fp16） | token ≥19/20 + 单步耗时对比 HF attention | 待做 |
 
 ## 怎么跑
 
@@ -80,6 +82,21 @@ prompt S = 441；每轮 重算 20 步 → 增量 20 步，共 5 轮交替
 （第一次走 `use_cache=True` 要建 cache、扩分配器，实测是 110 ms 的 15 倍）→ 剔除
 偏离中位数 2 倍以上的样本 → 取中位数。脚本 `m2_kvcache_bench.py` 自带这些步骤，
 并每轮 `assert` 两种实现输出逐位相同。
+
+## M3 的实测结果（gpt2 124M，fp32，batch=1，S=12 → 19）
+
+```
+M3a   8 步 × 12 层 K/V 与 HF DynamicCache 逐位相同        ← 分页语义对
+M3b-1 8 步 greedy token 与 M2 完全一致: True              ← cache 换掉也对
+池显存 72.0 MiB（容量 1024 token），本请求 2 块装 19 token
+```
+
+两个**不报错但结果错**的坑（都已修，值得记）：
+
+1. `patch_attention` 里直接 `for layer_idx ...: def patched(...)` → Python 闭包捕获的是
+   变量名，循环结束后 12 个 patched 全看到 `layer_idx=11`。必须用工厂函数绑参数。
+2. 我们自己管 cache，就必须自己传 `position_ids`：传 `past_key_values=None` 时 HF 认为
+   没有历史，每步位置都从 0 开始算 → 第一个 token 对、后面全崩（`[1849, 11, 11, ...]`）。
 
 ## 符号表（全项目统一，与 `kernels/` 的 CUDA 代码一致）
 
