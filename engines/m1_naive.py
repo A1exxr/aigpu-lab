@@ -79,7 +79,7 @@ def load():
 # @torch.inference_mode() 关梯度 + 更省的推理模式，推理首选
 @torch.inference_mode()
 def my_generate(model, input_ids, max_new):
-    """最笨的写法：每步都把整段序列重新 forward 一遍。"""
+    """最笨的写法：每步都把整段序列重新 forward 一遍"""
     ids = input_ids             # 当前已有的完整序列，一开始就就是prompt
     new_tokens = []             # 存放新生成的token，最后拼起来返回
     records = []                # 存放每步的性能属性
@@ -96,7 +96,7 @@ def my_generate(model, input_ids, max_new):
         
         ms = start.elapsed_time(end)                                            # 毫秒
 
-        # [B, S, V] 里 只有最后一个位置有用，前面 S-1 个位置的 logits 全扔
+        # [B, S, V] 里 只有最后一个位置有用，前面 S-1 个位置的 logits 全扔 ———— 所有的batch都取各自的最后一个位置(S-1)的token分数
         # argmax：返回最大值所在的索引；dim=-1，沿着最后一维找，保持维度不消
         # nxt是一个[1,1]的张量，就是[B,1] ———— 比如 tensor([[257]])
         nxt = logits[:, -1, :].argmax(dim=-1, keepdim=True)                     # greedy：取最大；keepdim=True 保持 [B,1]，方便 cat； 
