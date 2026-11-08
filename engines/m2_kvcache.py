@@ -58,14 +58,14 @@ def run_incremental(model, input_ids, max_new):
     """M2：历史交给 KV cache，每步只喂 1 个 token
 
     model(...) 支持 use_cache=True，返回一个 past_key_values 对象；
-    下一步把它原样传回去，并且 input_ids 只喂"最新那 1 个 token"。
-    position 会由 cache 自动推进，不需要你手动算。
+    下一步把它原样传回去，并且 input_ids 只喂"最新那 1 个 token"
+    position 会由 cache 自动推进，不需要你手动算
     """
     tokens, step_ms = [], []
     past = None
     ids = input_ids
 
-    for step in range(max_new):
+    for _ in range(max_new):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
