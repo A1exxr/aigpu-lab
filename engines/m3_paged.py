@@ -48,7 +48,7 @@ class BlockAllocator:
         ids = self.free[:n]                 # 取前 n 个
         # del是原地修改，所有引用这个 list 的地方都看到变化
         del self.free[:n]                   # 从 free 里移除
-        # update()是批量添加——接受一个可迭代对象，把里面每个元素都加进去；add() 只加一个元素
+        # update()是批量添加，接受一个可迭代对象，把里面每个元素都加进去；add() 只加一个元素
         self.used.update(ids)               # 加到 used，存的是具体的块号
         return ids
 
@@ -67,6 +67,7 @@ class BlockAllocator:
 # ---------------------------------------------------------------- 池
 # 池 管 KV存哪里
 # KVPool 只管“KV 张量”——不关心谁在用哪块，只负责“给我块号+偏移，我读写”
+# KVPool(...) 分配 75 MB（64 块 × 16 位置 × 12 层 × 12 头 × 64 维 × 2 × 4B）
 class KVPool:
     """布局与 kernel 完全一致：每层两块 [N_BLOCKS, BLOCK_SIZE, H, D]"""
     def __init__(self, n_layers, n_heads, head_dim, dtype=DTYPE):
@@ -99,7 +100,11 @@ class KVPool:
         
 
     def gather(self, layer, block_table, length):
-        """按 block_table 把前 length 个 token 的 k/v 拼回 [H, length, D]（注意维序）"""
+        """按 block_table 把分散在物理块里前 length 个 token 的k/v 收集回一个连续张量 [H, length, D]（注意维序）
+            但收集成逻辑连续的张量，是一次全量拷贝，n越大，拷贝越贵
+            每层 attention 之前都调，attention 需要“逻辑连续”的 K/V ———— q @ Kᵀ 要求 K 的序列维按 token 顺序排好
+        """
+        # length 为 当前实际写入了多少个 token
         # 按 token 序号 t=0..length-1：
         # blk = block_table[t // BLOCK_SIZE]，off = t % BLOCK_SIZE
         # 取 self.k[layer][blk, off] → 形状 [H, D]，最后 stack 成 [H, length, D]
@@ -116,7 +121,7 @@ class KVPool:
         # 逻辑坐标的映射是确定的，可预测的，对应关系没变
         # ks[0][0,0]（值 1）永远是 result[0,0,0]    ks[1][0,0]（值 5）永远是 result[0,1,0]
         # 因为要和 HF cache 的 [H, S, D] 维度顺序对齐
-        k = torch.stack(ks, dim=1)
+        k = torch.stack(ks, dim=1)          # gather返回的k v是没有batch维度的
         v = torch.stack(vs, dim=1)
         return k, v
 
@@ -190,7 +195,7 @@ def main():
 
             # ---- 2) 把这一步的 k/v 照抄进池
             # k_tok 和 v_tok 的 block_id 和 offset 是通过 全局 token 序号 t 映射出来的
-            for layer in range(L):
+            for layer in range(L):          # 同一个 token 在 12层里的t一样，算出的blk off也一样，但张量不一样，每一层都有一个k/v张量
                 k, v = layer_kv(past, layer)        # [B, H, S_all, D]
                 for j in range(n_new):
                     t = n_written + j                     # t是整个序列的第几个token，不是第几个新token，t是包含prompt的

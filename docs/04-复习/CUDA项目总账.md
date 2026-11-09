@@ -119,6 +119,8 @@
 - [ ] 能说出 GEMM 只到 cuBLAS 22% 的三个原因
 - [ ] 能说出 FlashAttention 的代价（重复读 K/V）
 - [ ] 能说出 launch 8.52 µs 与你项目的因果关系（到墙 → 往上找）
+- [ ] 能说出 mini 引擎 M2 的 3.79× 是"稳态单步"，3.23× 是"总耗时"，为什么两者不能混报
+- [ ] 能说出 "注册到 torch" 和 "`load_inline` 暴露一个函数" 差在哪（dispatcher / torch.compile / profiler / autograd）
 - [ ] 抽 3 题错题本 `待验证清单`，闭卷回答
 
 ---

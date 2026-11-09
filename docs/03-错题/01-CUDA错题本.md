@@ -1,6 +1,6 @@
 # CUDA 错题本
 
-> 读法：**§0 索引**按编号查（84 条，E-01 ~ E-98，有空号）→ **§1–§9 按主题分组**（同类错误放一起）
+> 读法：**§0 索引**按编号查（88 条，E-01 ~ E-104，有空号）→ **§1–§9 按主题分组**（同类错误放一起）
 > → **§10 已答对** → **§11 复习记录** → **§12 待验证清单**。
 > 早期的「原始散记 / 使用协议」已整体搬到同目录 `01-CUDA错题本-散记存档.md`（内容一字未改）。
 
@@ -103,6 +103,10 @@
 | `E-96` | TF32：不写 input_precision=ieee 就过不了 1e-5 | 精度与单位 | 1 |
 | `E-97` | 共享内存预算：按 stage 数乘，加中间缓冲 | 内存层级与访存 | 1 |
 | `E-98` | delta 的两种算法：do∘o 与 dp∘p 何时可用 | 算法与建模 | 1 |
+| `E-101` | warp shuffle 的 offset 起点是 **16**，不是 `blockDim.x/2` | 归约与同步 | 2 |
+| `E-102` | 行跨度 32 word → 32 条 lane 同 bank → **32 路**，不是 16 路 | 内存层级与访存 | 2 |
+| `E-103` | `MAXB` = 每请求最多几页；`context_lens` = 每请求已写入的 KV 长度 | 并行映射与索引 | 1 |
+| `E-104` | split-L 的动机是 decode 并行度不足，判据 = `dram ≥ 90%` + SM 打满 | 性能判断与调参 | 1 |
 
 **每个簇最容易错的那一点**
 
@@ -411,6 +415,20 @@ float wv = __half2float(w[offset]);               // ← w 只有 4096 个元素
 - **记忆点**：`O[i,d] = Σ_j P[i,j]·V[j,d]` —— **乘的是 j，输出的是 d**。`j` 在 P 里是行内的连续下标（`p_base+j`），在 V 里是**行号**（`j*D`）。
 
 
+E-103（新增，🔴）`MAXB` 与 `context_lens` 各是什么：把「页数」当成了「块内 token 数」
+
+<sub>出处：2026-11-09 自测 Q4（paged attention 接口）</sub>
+
+- **题**：`paged_attn_split(q[B,H,D], k_cache[NB,BS,H,D], v_cache, block_table[B,MAXB], context_lens[B])`
+- **我的答**：「`MAXB` 是每个物理块的最大 token 数量」、「`context_lens` 是当前批次的上下文长度」、「不知道没有它会怎样」。
+- **正解**：
+  - `MAXB` = **`block_table` 的第二维**，即「一个请求最多允许用几页」。它是**容量参数**，跟每页装几个 token 无关。
+  - 每页装几个 token 是 **`BS`（= `BLOCK_SIZE`）**，写在 `k_cache[NB,BS,H,D]` 的第二维里。
+  - `context_lens[b]` = **第 b 个请求当前已经写入池的 KV 长度**（`[B]`，一个请求一个数）。
+- **没有 `context_lens` 会怎样**：kernel 不知道每行该读到第几个 token，只能读到 `MAXB*BS`；于是**读进别的请求的 KV**（串味）或读到没写过的位置（垃圾值），并且 causal mask 的边界也没了——结果是「不报错，数值全错」。
+- **顺带纠正**：`block_table` 是「逻辑页号 → 物理块号」的映射表，**不是**逻辑→物理的字节偏移，也不含长度信息。
+- **记忆**：`MAXB` 管**页数上限**，`BS` 管**页大小**，`context_lens` 管**读到哪**。三个都不在同一个量纲上。
+
 ## §2 归约与同步
 
 ❌ E-02　把「线程束分化」当成「一部分线程等另一部分」
@@ -660,6 +678,40 @@ E-62 `__shfl_down_sync` 是「取值」，不是「累加」
   - 后果：**不崩、不报错、形状全对、数值全错** → bench `[WRONG]`。
 - 对照：`w2_softmax.cu` 里写对了（`x += __shfl_down_sync(...)`），说明知识点有过，这次是复制时手滑 → 归约一律先问自己「这是不是在累积」。
 
+
+E-101（新增，🔴 E-15 族第 2 次）`__shfl_down_sync` 的 offset 起点写成了 `blockDim.x/2`
+
+<sub>出处：2026-11-09 自测 Q1（默写两级归约骨架）</sub>
+
+- **错**：
+  ```cuda
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1)   // ❌ blockDim.x=256 → 起点 128
+      acc += __shfl_down_sync(0xffffffff, acc, offset);
+  ```
+- **为什么错**：`__shfl_down_sync` 只在**一个 warp（32 条 lane）内部**通信。`offset = 128` 意味着「取 lane+128 的值」，越界的 lane 不参与，硬件直接返回**自己的值**。于是 8 轮循环全是空转，`acc` 一直是每个线程自己的那个数；lane 0 写出去的是它自己的值，**不是 warp 和**。
+- **正解**：warp 内归约的 offset **恒从 16 开始**，与 `blockDim.x` 无关：
+  ```cuda
+  for (int offset = 16; offset > 0; offset >>= 1)
+      acc += __shfl_down_sync(0xffffffff, acc, offset);
+  ```
+- **同题第二处错**：跨 warp 汇总写成了 `out[warp_id]` / `out[0]`。`out` 是**最终输出**（每 block 只写一格 `out[blockIdx.x]`），跨 warp 中转必须用 `__shared__ float s[32];`，最后只有 `blockIdx.x` 那一格被写。
+- **完整骨架（记住这三块）**：
+  ```cuda
+  // 级别 1：warp 内，8 轮（256 线程 = 8 warp，每 warp 5 轮 16→1）
+  for (int offset = 16; offset > 0; offset >>= 1)
+      acc += __shfl_down_sync(0xffffffff, acc, offset);
+  if (lane == 0) s[warp_id] = acc;
+  __syncthreads();                    // 8 个 warp 的值都写完才许读
+  // 级别 2：warp 0 收 8 个值（3 轮 4→1）
+  if (warp_id == 0) {
+      float k = (lane < num_warps) ? s[lane] : 0.f;
+      for (int offset = 4; offset > 0; offset >>= 1)
+          k += __shfl_down_sync(0xffffffff, k, offset);
+      if (lane == 0) out[blockIdx.x] = k;
+  }
+  ```
+- **两个轮数别混**：级别 1 是 `log2(32) = 5` 轮（warp 内固定）；级别 2 是 `log2(warp 数)` 轮（256 线程 → 8 warp → 3 轮）。
+- **记忆**：**shuffle 只在 warp 内，所以起点永远是 16；`blockDim.x/2` 只属于「共享内存树形归约」。**
 
 ## §3 内存层级与访存
 
@@ -920,6 +972,29 @@ E-70（新增，🟡）共享内存只算了 A 的一块，忘了 B（E-67 的�
   线程 `1536/64 = 24` ⇒ **真正上限 24 个 block（1536 线程 / 48 warp / 100% occupancy）**。
 - **记忆**：GEMM 的 tile 永远是**两块**（A 一块、B 一块）；问"共享内存多少"要先把两块加起来。
   这就是 E-67 里 `AI = T/2` 的来源——同一个「忘了 B」的毛病，第 2 次出现。
+
+E-102（新增，🟡 E-15 族）行跨度 32 word → 32 条 lane 同 bank，是 **32 路**不是 16 路
+
+<sub>出处：2026-11-09 自测 Q3（bank 计算）</sub>
+
+- **题**：`__shared__ half As[64][64];`，warp 内第 `lane` 条线程读 `As[r + lane][c]`（同一 warp 指令里 `c` 相同），问几路冲突。
+- **我的答**：「行跨度 128 B = 32 word，bank 与 r 无关、每行都从 bank 0 起，32 条 lane 落到 1 个 bank 上」→ ✅ 这条推导全对；然后写「**16-way conflict**」→ ❌。
+- **错在**：32 条 lane 全落在**同一个 bank 的不同 word** 上 ⇒ **32 路冲突**（32 次串行）。16 路是「一个 warp 只处理 16 行」那种访问模式下的答案，这里 `lane` 跑满 32 条。
+- **bank 公式三步（每次都要写全）**：
+  1. 字节地址 = `(r * 列数 + c) * sizeof(T)`
+  2. word 地址 = 字节 / 4
+  3. bank = word % 32
+- **三档对照（同一块 64 行）**：
+
+  | 声明 | 行跨度 | word 跨度 | 行起点 bank | 32 lane 落在几个 bank | 冲突 |
+  |---|---|---|---|---|---|
+  | `As[64][64]` | 128 B | 32 | `(32r + c/2)%32` → 恒 `c/2` | **1** | **32 路** |
+  | `As[64][40]` | 80 B | 20 | `(20r + c/2)%32`，`gcd(20,32)=4` | **8** | **4 路**（`32/8`） |
+  | `As[64][65]` | 130 B | 32.5（非整） | 每行错开 2 B → 16 B 事务被拆 | — | 反而更慢（不报错） |
+
+- 补充：`[64][40]` 时 8 个起点恰好是 `0, 20, 8, 28, 16, 4, 24, 12`（我这次算对了这一问）。
+- **`[64][65]` 为什么更差**：130 B **不是 16 的倍数**，一行的 16 字节向量访存会跨两个 16 B 事务 → 一次访问拆两次 → 有效带宽掉；而且**编译期不报错**，是静默退化（`[32][33]` 慢 41% 就是这类）。
+- **记忆**：**冲突路数 = 32 ÷ 落到的不同 bank 数**；而不同 bank 数 = `32 / gcd(行跨度 word 数, 32)`。
 
 ## §4 精度与单位
 
@@ -1616,6 +1691,23 @@ E-66（新增，🔴）把「FLOPS 利用率」当成「SRAM 使用率」
 ---
 
 
+E-104（新增，🔴）split-L 的动机：不是「为了 prefill」，是 decode 并行度不足
+
+<sub>出处：2026-11-09 自测 Q4(b)(c)</sub>
+
+- **我的答**：「为了代码的通用性，prefill 阶段 prompt 很长，split-L 算得更快」→ 与事实**相反**。
+- **正解**：
+  - 这个 kernel **只处理单 query**（`q[B,H,D]`），prefill（S>1）走的是 SDPA，根本不进这个 kernel。
+  - decode 时 `grid = B*H`：项目里 `B=8, H=32` → 256 个 block，而卡上有 24 SM；每个 block 只算「1 行 query 对 L 个 token」，活太少 → **SM 打不满、DRAM 也喂不饱**。
+  - split-L 把 `L` 切成 `NSPLIT=4` 段，`grid = B*H*NSPLIT = 1024`，每段算 partial（`m/l/acc`），再 merge 成最终结果。
+- **判据（面试会问的两条）**：
+  1. `ncu` 的 `dram__throughput ≥ 90%`（带宽真喂饱了，不是「慢在别处」）
+  2. grid 能把 SM 打满（每 SM 至少 1–2 个 block 常驻）
+  两条**同时**满足才说明「已经贴墙、只能靠并行度换时间」。
+- **实测**：`2.3644 → 1.8897 → 1.5084 → 1.2483 ms`（1.89×），末版 `216.0 GB/s / 97.6%`。
+- **代价**：4 段 partial `[B,H,4,D]` 要写一次、merge 再读一次、结果写一次 ≈ `3 × 8×32×128×4 B ≈ 1.5 MiB`（项目里报「额外约 1 MiB」，同量级）。
+- **记忆**：**split 换的是并行度，不是算法**；先看 `dram%` 和 SM 占用，再决定切不切。
+
 ## §8 算法与建模
 
 ❌ E-08　归一化分母用错：应该是 `cols`，不是 `rows * cols`
@@ -1923,6 +2015,10 @@ for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
 - [ ] **E-46** `float sum;` 不初始化，`sum += ...` 会怎样？CUDA 会给默认值吗？
 - [ ] **E-47** kernel 形参写 `const int eps`、host 传 `1e-6`，kernel 里实际收到什么？报错吗？
 - [ ] **E-48** 📘 bench 的 `cpp_signature` 和你的 host 函数不一致时，会在**编译**还是**跑分**阶段暴露？症状是什么？
+- [ ] **E-101** 🔴 **默写**两级归约骨架：warp 内 shuffle 的 offset **从几开始**？为什么不是 `blockDim.x/2`？跨 warp 中转用全局 `out` 会怎样？
+- [ ] **E-102** 🟡 `__shared__ half As[64][64]` 里 32 条 lane 读 `As[r+lane][c]`：写出 bank 公式，**几路冲突**？改成 `[64][40]` 呢？`[64][65]` 为什么更慢？
+- [ ] **E-103** 🔴 `paged_attn_split` 的 `MAXB` 和 `context_lens` 各是什么？**没有 `context_lens` 会怎样？**
+- [ ] **E-104** 🔴 split-L 到底为谁服务（prefill 还是 decode）？**判据是哪两个 ncu 指标**？merge 额外读写多少字节？
 **升级规则**：同一题**连续两次**答对 → 标 🟢，移出待验证清单。
 **降级规则**：答对一次后又答错 → 回到 🔴，并新增一条错误记录。
 
