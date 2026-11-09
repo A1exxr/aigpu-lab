@@ -37,6 +37,9 @@ class PagedState:
     """一次请求的分页状态：池 + 分配器 + block_table + 已写入的 token 数"""
 
     def __init__(self, n_layers, n_heads, head_dim, dtype):
+        # 当前设计有缺陷：当前代码是“每个请求一个独立池”，不是“全局共享池”，因为每个 PagedState 都会新建一个池和分配器
+        # 多请求会实例化多份池，各占 75 MB，互不共享
+        # vllm是 池 和 分配器 全局共享，每请求一张 block_table
         self.pool = KVPool(n_layers, n_heads, head_dim, dtype)
         self.alloc = BlockAllocator(N_BLOCKS)
         self.table = []                                             # 本请求用到的块号，按顺序
@@ -97,8 +100,8 @@ def patch_attention(model, state):
             B, S, _ = hidden_states.shape           # hidden_states[B, S, 768]
 
             # 1) 用 HF 自己的投影算 q/k/v（权重不动，只换 cache 与 attention 的算法）
-            qkv = attn.c_attn(hidden_states)                     # [B, S, 3E]  E=768
-            q, k, v = qkv.split(attn.split_size, dim=2)          # 沿着第二维拆开，每个都是 [B, S, E]
+            qkv = attn.c_attn(hidden_states)            # [B, S, 3E]  E=768        这里不用写第几层的qkv投影，参数 attn 里面有12层各自的qkv投影，layer_idx：写哪层的池；attn用哪层权重；两者必须成对
+            q, k, v = qkv.split(attn.split_size, dim=2)          # 沿着第二维拆开，每个都是 [B, S, E]，这里的split_size是HF里面自己定义好的，值就是768
             # E = H * D = 768   H = 12  D = 64，768维被拆成 12个头*64维
             # view就是把768按照H=12，D=64拆开
             q = q.view(B, S, H, D).transpose(1, 2)          # [B,S,H,D] ——> [B,H,S,D]
@@ -110,15 +113,24 @@ def patch_attention(model, state):
             state.append(layer_idx, k[0], v[0])     
             if layer_idx == 0:
                 state.n += S                        # 先推进n，再gather，此时n是当前总数
+            '''
+                知识点： 关于这里的 state 
+                    patched 定义时：完全不知道 state 是什么 ———— 只是“引用一个叫 state 的变量”
+                    patched 只关心 state 有没有 append/gather 方法，不关心它是不是 PagedState 类型
+                    patched 被调用时：执行到 state.append(...)，这时才去 state 指向的对象上找 append 方法
+                    如果 main 里没实例化就传进来，运行时调 state.append(...) 会直接 AttributeError
+
+                    因为 python 是动态型语言，在运行时才会检查变量类型；C++是静态类型，写代码时就会报错
+            '''
 
             # 3) 从池里取回全部 K/V：[B,H,n,D]
             K, V = state.gather(layer_idx)          # [H,n,D]，取回的是包含这一步新token的完整KV
-            K, V = K.unsqueeze(0), V.unsqueeze(0)   # 在dim=0插入新维度 [H, n, D] ——> [1, H, n, D]
+            K, V = K.unsqueeze(0), V.unsqueeze(0)   # 在dim=0插入新维度 [H, n, D] ——> [1, H, n, D]， F.sdpa 要求 [B, H, n, D]
 
-            # 4) attention 用 PyTorch 内置的 attention 算子
-            out = F.scaled_dot_product_attention(q, K, V, is_causal=(S > 1), scale=scaling)   # [B,H,S,D]
+            # 4) attention 用 PyTorch 内置的 attention SDPA算子
+            out = F.scaled_dot_product_attention(q, K, V, is_causal=(S > 1), scale=scaling)   # [B,H,S,D]       
             out = out.transpose(1, 2).reshape(B, S, H * D)      # [B,H,S,D] ——> [B,S,H,D] ——>  [B,S,768]
-            out = attn.c_proj(out)      # attn.c_proj：HF 的输出投影（Linear(768,768)） 权重不动
+            out = attn.c_proj(out)      # attn.c_proj：HF 的输出投影（Linear(768,768)） 用相同的权重和偏置
             return out, None
 
         return patched
@@ -127,6 +139,7 @@ def patch_attention(model, state):
     # 调用工厂，返回“绑定了这一层 layer_idx, attn, H, D, scaling 的 patched
     for layer_idx, block in enumerate(blocks):
         attn = block.attn           # attn 是 GPT2Attention的实例
+        # make_patched返回一个函数对象，让 block.attn.forward 走我的 patched 方法
         block.attn.forward = make_patched(layer_idx, attn,
                                           attn.num_heads, attn.head_dim, attn.scaling)
 
@@ -143,13 +156,14 @@ def main():
 
     # ---- 基线：M2 的做法（HF 原生 DynamicCache）----
     with torch.inference_mode():
-        base = ids.clone()
+        base = ids.clone()      # 深拷贝
         past = None
         for step in range(STEPS):
             inp = base if step == 0 else base[:, -1:]
             o = model(inp, past_key_values=past, use_cache=True)
             past = o.past_key_values
             base = torch.cat([base, o.logits[:, -1, :].argmax(-1, keepdim=True)], dim=1)
+    # base是ids的形状：[B, S]，第0维取0，第1维取不包括prompt的token ———— batch 0 的 8 个新 token
     base_tokens = base[0, ids.shape[1]:].tolist()
 
     # ---- 对照：我们的分页池 + 自算 attention ----
@@ -160,9 +174,10 @@ def main():
         for step in range(STEPS):
             inp = cur if step == 0 else cur[:, -1:]
             # position_ids 必须自己给：我们传 past_key_values=None，
-            # HF 会认为“没有历史”→ 每步位置都从 0 开始，decoder 看到的位置全错
+            # HF 会认为 没有历史，然后每步位置都从 0 开始，decoder 看到的位置全错，所以要手动设置 真实位置pos(这一步每个token在序列的绝对位置)
             start = state.n
-            pos = torch.arange(start, start + inp.shape[1], device=cur.device).unsqueeze(0)
+            # pos是 [1, S] 的整数张量，这一步的 S 个 token，各自在全局序列里排第几号
+            pos = torch.arange(start, start + inp.shape[1], device=cur.device).unsqueeze(0)   # 补 batch 维度
             o = model(inp, past_key_values=None, use_cache=False,
                       position_ids=pos)                          # 不再用 HF cache
             cur = torch.cat([cur, o.logits[:, -1, :].argmax(-1, keepdim=True)], dim=1)

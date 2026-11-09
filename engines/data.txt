@@ -1,161 +1,130 @@
-Loading weights: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 411.11it/s]
-prompt 长度 S = 441
-符号：B batch / S 序列长度 / D head 维度 / H head 数 / L 层数 / V 词表
-gpt2：L=12 H=12 D=64 V=50257；KV cache 每 token = 72 KiB（fp32）
+(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m4_metrics.py
+Loading weights: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 529.89it/s]
+gpt2: L=12 H=12 D=64 dtype=torch.float16，编译 kernel ...
 
---- 正确性 ---
-重算版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-增量版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-逐位一致: True
+[prompt 重复 1 次 → S=12，生成 20 步，3 轮交替]
+    轮 1:    547.6 ms   (冷启动，丢弃)
+    轮 2:     93.4 ms
+    轮 3:     92.8 ms
+    轮 1:    163.4 ms   (冷启动，丢弃)
+    轮 2:    102.8 ms
+    轮 3:     98.8 ms
 
---- 单步耗时（ms）---
-重算版  首/末: 24.74 / 18.00
-增量版  首/末: 16.39 / 5.23
-总耗时  重算 520.1 ms  →  增量 332.5 ms
-加速比: 1.56x
-峰值显存: 704.5 MB
-KV cache（S=461）应占: 32.4 MB
-(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m2_kvcache.py
-Loading weights: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 1431.03it/s]
-prompt 长度 S = 441
-符号：B batch / S 序列长度 / D head 维度 / H head 数 / L 层数 / V 词表
-gpt2：L=12 H=12 D=64 V=50257；KV cache 每 token = 72 KiB（fp32）
+[prompt 重复 40 次 → S=441，生成 20 步，3 轮交替]
+    轮 1:    117.1 ms   (冷启动，丢弃)
+    轮 2:    101.0 ms
+    轮 3:     95.2 ms
+    轮 1:    211.4 ms   (冷启动，丢弃)
+    轮 2:    213.2 ms
+    轮 3:    221.9 ms
 
---- 正确性 ---
-重算版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-增量版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-逐位一致: True
+==============================================================================
+  prompt       实现   TTFT(ms)   TPOT(ms)    吞吐(tok/s)   token 一致
+------------------------------------------------------------------------------
+      12 HF cache       5.27       4.58        214.8         20
+      12      我们的       8.52       4.74        198.4         20
+     441 HF cache       7.38       4.60        203.9         20
+     441      我们的     127.62       4.94         91.9         20
+==============================================================================
 
---- 单步耗时（ms）---
-重算版  首/末: 22.17 / 20.21
-增量版  首/末: 17.91 / 5.66
-总耗时  重算 493.4 ms  →  增量 946.7 ms
-加速比: 0.52x
-峰值显存: 704.5 MB
-KV cache（S=461）应占: 32.4 MB
-(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m2_kvcache.py
-Loading weights: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 1399.01it/s]
-prompt 长度 S = 441
-符号：B batch / S 序列长度 / D head 维度 / H head 数 / L 层数 / V 词表
-gpt2：L=12 H=12 D=64 V=50257；KV cache 每 token = 72 KiB（fp32）
+判定：
+  S=12: token 一致 20/20  PASS
+  S=441: token 一致 20/20  PASS
+(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m4_metrics.py
+Loading weights: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 476.42it/s]
+gpt2: L=12 H=12 D=64 dtype=torch.float16，编译 kernel ...
 
---- 正确性 ---
-重算版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-增量版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-逐位一致: True
+[prompt 重复 1 次 → S=12，生成 20 步，3 轮交替]
+    轮 1:    619.1 ms   (冷启动，丢弃)
+    轮 2:     92.8 ms
+    轮 3:     89.3 ms
+    轮 1:    229.6 ms   (冷启动，丢弃)
+    轮 2:    100.6 ms
+    轮 3:    101.6 ms
 
---- 单步耗时（ms）---
-重算版  首/末: 22.25 / 18.67
-增量版  首/末: 15.63 / 5.82
-总耗时  重算 405.0 ms  →  增量 371.4 ms
-加速比: 1.09x
-峰值显存: 704.5 MB
-KV cache（S=461）应占: 32.4 MB
-(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m2_kvcache.py
-Loading weights: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 1964.91it/s]
-prompt 长度 S = 441
-符号：B batch / S 序列长度 / D head 维度 / H head 数 / L 层数 / V 词表
-gpt2：L=12 H=12 D=64 V=50257；KV cache 每 token = 72 KiB（fp32）
+[prompt 重复 40 次 → S=441，生成 20 步，3 轮交替]
+    轮 1:    128.6 ms   (冷启动，丢弃)
+    轮 2:    105.5 ms
+    轮 3:    109.9 ms
+    轮 1:    234.6 ms   (冷启动，丢弃)
+    轮 2:    218.5 ms
+    轮 3:    218.8 ms
 
---- 正确性 ---
-重算版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-增量版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-逐位一致: True
+==============================================================================
+  prompt       实现   TTFT(ms)   TPOT(ms)    吞吐(tok/s)   token 一致
+------------------------------------------------------------------------------
+      12 HF cache       5.05       4.41        219.6         20
+      12      我们的       8.05       4.91        197.8         20
+     441 HF cache       7.37       5.37        185.7         20
+     441      我们的     129.30       4.70         91.5         20
+==============================================================================
 
---- 单步耗时（ms）---
-重算版  首/末: 21.28 / 17.30
-增量版  首/末: 16.27 / 5.37
-总耗时  重算 413.0 ms  →  增量 281.0 ms
-加速比: 1.47x
-峰值显存: 704.5 MB
-KV cache（S=461）应占: 32.4 MB
-(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m2_kvcache.py
-Loading weights: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 1993.98it/s]
-prompt 长度 S = 441
-符号：B batch / S 序列长度 / D head 维度 / H head 数 / L 层数 / V 词表
-gpt2：L=12 H=12 D=64 V=50257；KV cache 每 token = 72 KiB（fp32）
+判定：
+  S=12: token 一致 20/20  PASS
+  S=441: token 一致 20/20  PASS
+^C/home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m4_metrics.py
 
---- 正确性 ---
-重算版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-增量版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-逐位一致: True
+(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m4_metrics.py
+Loading weights: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 551.52it/s]
+gpt2: L=12 H=12 D=64 dtype=torch.float16，编译 kernel ...
 
---- 单步耗时（ms）---
-重算版  首/末: 25.27 / 17.61
-增量版  首/末: 15.74 / 4.58
-总耗时  重算 420.8 ms  →  增量 202.1 ms
-加速比: 2.08x
-峰值显存: 704.5 MB
-KV cache（S=461）应占: 32.4 MB
-(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m2_kvcache.py
-Loading weights: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 2164.41it/s]
-prompt 长度 S = 441
-符号：B batch / S 序列长度 / D head 维度 / H head 数 / L 层数 / V 词表
-gpt2：L=12 H=12 D=64 V=50257；KV cache 每 token = 72 KiB（fp32）
+[prompt 重复 1 次 → S=12，生成 20 步，3 轮交替]
+    轮 1:    641.0 ms   (冷启动，丢弃)
+    轮 2:     88.1 ms
+    轮 3:     86.7 ms
+    轮 1:    213.8 ms   (冷启动，丢弃)
+    轮 2:    100.1 ms
+    轮 3:     99.7 ms
 
---- 正确性 ---
-重算版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-增量版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-逐位一致: True
+[prompt 重复 40 次 → S=441，生成 20 步，3 轮交替]
+    轮 1:    132.0 ms   (冷启动，丢弃)
+    轮 2:     88.1 ms
+    轮 3:     91.3 ms
+    轮 1:    226.3 ms   (冷启动，丢弃)
+    轮 2:    213.5 ms
+    轮 3:    210.2 ms
 
---- 单步耗时（ms）---
-重算版  首/末: 24.26 / 23.13
-增量版  首/末: 16.25 / 5.06
-总耗时  重算 425.0 ms  →  增量 182.4 ms
-加速比: 2.33x
-峰值显存: 704.5 MB
-KV cache（S=461）应占: 32.4 MB
-(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m2_kvcache.py
-Loading weights: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 2102.53it/s]
-prompt 长度 S = 441
-符号：B batch / S 序列长度 / D head 维度 / H head 数 / L 层数 / V 词表
-gpt2：L=12 H=12 D=64 V=50257；KV cache 每 token = 72 KiB（fp32）
+==============================================================================
+  prompt       实现   TTFT(ms)   TPOT(ms)    吞吐(tok/s)   token 一致
+------------------------------------------------------------------------------
+      12 HF cache       4.67       4.30        228.9         20
+      12      我们的       8.25       4.80        200.2         20
+     441 HF cache       9.26       4.30        223.0         20
+     441      我们的     120.13       4.73         94.4         20
+==============================================================================
 
---- 正确性 ---
-重算版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-增量版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-逐位一致: True
+判定：
+  S=12: token 一致 20/20  PASS
+  S=441: token 一致 20/20  PASS
+(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m4_metrics.py
+Loading weights: 100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 446.90it/s]
+gpt2: L=12 H=12 D=64 dtype=torch.float16，编译 kernel ...
 
---- 单步耗时（ms）---
-重算版  首/末: 21.12 / 19.17
-增量版  首/末: 17.97 / 4.91
-总耗时  重算 421.9 ms  →  增量 181.2 ms
-加速比: 2.33x
-峰值显存: 704.5 MB
-KV cache（S=461）应占: 32.4 MB
-(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m2_kvcache.py
-Loading weights: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 1963.56it/s]
-prompt 长度 S = 441
-符号：B batch / S 序列长度 / D head 维度 / H head 数 / L 层数 / V 词表
-gpt2：L=12 H=12 D=64 V=50257；KV cache 每 token = 72 KiB（fp32）
+[prompt 重复 1 次 → S=12，生成 20 步，3 轮交替]
+    轮 1:    607.0 ms   (冷启动，丢弃)
+    轮 2:     89.4 ms
+    轮 3:     88.3 ms
+    轮 1:    214.8 ms   (冷启动，丢弃)
+    轮 2:    105.1 ms
+    轮 3:    104.0 ms
 
---- 正确性 ---
-重算版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-增量版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-逐位一致: True
+[prompt 重复 40 次 → S=441，生成 20 步，3 轮交替]
+    轮 1:    144.3 ms   (冷启动，丢弃)
+    轮 2:     88.4 ms
+    轮 3:     89.9 ms
+    轮 1:    213.6 ms   (冷启动，丢弃)
+    轮 2:    216.2 ms
+    轮 3:    212.5 ms
 
---- 单步耗时（ms）---
-重算版  首/末: 21.19 / 20.42
-增量版  首/末: 17.26 / 4.96
-总耗时  重算 419.9 ms  →  增量 186.2 ms
-加速比: 2.25x
-峰值显存: 704.5 MB
-KV cache（S=461）应占: 32.4 MB
-(triton) alex@Alex:~/projects/aigpu-lab/engines$ /home/alex/miniconda3/envs/triton/bin/python /home/alex/projects/aigpu-lab/engines/m2_kvcache.py
-Loading weights: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 148/148 [00:00<00:00, 2001.62it/s]
-prompt 长度 S = 441
-符号：B batch / S 序列长度 / D head 维度 / H head 数 / L 层数 / V 词表
-gpt2：L=12 H=12 D=64 V=50257；KV cache 每 token = 72 KiB（fp32）
+==============================================================================
+  prompt       实现   TTFT(ms)   TPOT(ms)    吞吐(tok/s)   token 一致
+------------------------------------------------------------------------------
+      12 HF cache       4.99       4.36        225.1         20
+      12      我们的       8.22       5.03        191.3         20
+     441 HF cache       7.97       4.29        224.4         20
+     441      我们的     120.87       4.80         93.3         20
+==============================================================================
 
---- 正确性 ---
-重算版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-增量版: '\xa0The history of the Roman Empire is long and complicated. The history of the Roman Empire is long'
-逐位一致: True
-
---- 单步耗时（ms）---
-重算版  首/末: 21.09 / 62.48
-增量版  首/末: 15.78 / 5.40
-总耗时  重算 445.3 ms  →  增量 187.4 ms
-加速比: 2.38x
-峰值显存: 704.5 MB
-KV cache（S=461）应占: 32.4 MB
+判定：
+  S=12: token 一致 20/20  PASS
+  S=441: token 一致 20/20  PASS

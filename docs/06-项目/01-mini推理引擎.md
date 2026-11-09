@@ -377,14 +377,24 @@ context_lens = [10, 37, 128, 300]
 
 ## 11. 里程碑（按台阶，不按天数）
 
-| # | 交付物 | 完成标志 |
-|---|---|---|
-| M1 | `tests/test_step1_baseline.py` + `results/engine_ref_tokens.json` | 与 HF 20 token 一致 |
-| M2 | `block_manager.py` + `cache.py` + `test_step2_paged.py` | 与 M1 逐 token 一致 |
-| M3 | `scheduler.py` + `engine.py` + `test_step3_batch.py` | batch=4/8 一致 + 吞吐表 |
-| M4 | `engine/README.md` + 本文状态改成"已完成" | 别人照 README 能跑出同样的数 |
+| # | 交付物 | 完成标志 | 状态 |
+|---|---|---|---|
+| M1 | `engines/m1_naive.py` | 与 HF 20 token **逐位一致**（325.7 ms，每步 7–9 ms） | ✅ |
+| M2 | `engines/m2_kvcache.py` + `m2_kvcache_bench.py` | 逐位一致 5/5；稳态单步 `18.57 → 4.89 ms`（**3.79×**），总耗时 `355.0 → 110.1 ms`（**3.23×**） | ✅ |
+| M3a | `engines/m3_paged.py` | 池 `[NB,BS,H,D]` + 块表 + 分配器，`torch.equal` 全一致；第 17 token 首次跨块；池 72 MiB | ✅ |
+| M3b-1 | `engines/m3_paged_attn.py` | **cache 换成自己的池**，attention 仍 SDPA；token 与 HF 完全一致 | ✅ |
+| M3b-2 | 同上 + `paged_attn_split` | **attention 换自研 kernel**；逐 token 一致，端到端 **0.93×**（S=13） | ✅ |
+| **M4** | `engines/m4_metrics.py` | TTFT / TPOT / 吞吐 三个指标能报，且口径写清 | ⬜ **下一个** |
+| **M5** | `engines/m5_batching.py` | continuous batching：新请求进正在跑的 batch；吞吐 ≥ 串行 × N，且逐 token 一致 | ⬜ |
+| **R1** | `engines/fa_op.py` | 自研 FA 注册成 `torch.ops.aigpu.flash_attn`（`custom_op` + `register_fake` + autograd），`torch.compile` 不 graph break，profiler 里能看到名字 | ⬜ M5 之后 |
 
 **每完成一个 M，就 commit 一次，并在 commit message 里写当次的数字**（这个项目最值钱的就是"每一步都有数"）。
+
+### 顺序不能换的理由
+
+- **M4 在 M5 前**：没有 TTFT/TPOT/吞吐三个指标，M5 加了 batching 也说不清"快了还是慢了"。
+- **M5 在 R1 前**：batching 才是分页 KV 真正兑现的地方（单请求时 2 块 / 1024 token 容量 = 2% 利用率，分页收益接近 0）。先把收益做出来，再去接算子注册。
+- **R1 独立于引擎**：它用的是 `w11` 的 FA，不阻塞引擎进度；放在 M5 之后是因为它需要"有个能跑的模型"来验证替换 SDPA 后的端到端。
 
 ---
 
@@ -401,6 +411,20 @@ context_lens = [10, 37, 128, 300]
 
 ## 13. 现在的位置
 
-- ✅ 已有：`paged_attn_split` kernel（1.2483 ms、97.6% 实测带宽）、`ref_paged_attn` 参考实现、`build_module()` 编译链、`results/` 口径
-- ⬜ 未开始：`engine/` 下所有文件
-- 下一步：**M1**。纯 PyTorch，不碰 CUDA，跑通"单请求 20 token 与 HF 一致"再说别的。
+**已完成（2026-11-08）**
+- ✅ `paged_attn_split` kernel：`1.2483 ms`、`216.0 GB/s`、**97.6%** 实测带宽、八版对照全部跑完
+- ✅ `engines/` 五个文件：`m1_naive.py`（逐位一致）、`m2_kvcache.py` + `m2_kvcache_bench.py`（**3.79×** 稳态）、`m3_paged.py`（池+块表+分配器，逐位一致）、`m3_paged_attn.py`（**cache 换成自己的池**，token 与 HF 完全一致）
+- ✅ `m3_paged_kernel.py`：**attention 换成自研 kernel**，逐 token 一致，端到端 **0.93×**（S=13）
+- ✅ 两个静默 bug 已记入 `engines/README.md`（闭包晚绑定、`position_ids` 未传）
+
+**当前队列（按顺序做，不插队）**
+
+| 顺序 | 做什么 | 预计 | 判据 |
+|---|---|---|---|
+| 1 | **M4 指标**：`m4_metrics.py` 报 TTFT / TPOT / 吞吐 | 0.5–1 h | 三个数都有定义、能复现 |
+| 2 | **M5 continuous batching**：`m5_batching.py`，新请求插进正在跑的 batch | 3–4 h | 逐 token 一致 + 吞吐对比串行 |
+| 3 | **R1 注册算子**：`fa_op.py`，`torch.ops.aigpu.flash_attn` | 1.5 h | `torch.compile` 不 graph break + profiler 可见 |
+| 4 | **推理优化（系统层）**：量化 / PD 分离 / 引擎源码，按面试反馈选 | 长期 | 每项都要有一个数 |
+
+**不做**：chunked prefill、preemption、tensor parallel、权重加载格式。理由见 §9——每加一个组件必须能报一个数字，不追功能数量。
+
