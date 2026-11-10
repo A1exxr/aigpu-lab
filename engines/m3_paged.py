@@ -129,7 +129,7 @@ class KVPool:
     '''新增两个方法，优化M4
         write_run 和 gather_run
     '''
-    def write_run(self, layer, idx, k, v):
+    def write_run(self, layer, idx, k, v):     
         '''
             prefill 一批 token 一次性写进池
 
@@ -139,17 +139,38 @@ class KVPool:
         k/v: [len, H, D] —— 本步新算出来的 K/V（已按 token 排在前面）
 
         '''
-        self.k[layer].view(-1, self.H, self.D).index_copy_(0, idx, k)  # [N_BLOCKS*BLOCK_SIZE, H, D]
+        # scatter：一批 token 一次写进池
+        # self.k[layer] 形状为[N_BLOCKS, BLOCK_SIZE, H, D] = [64, 16, 12, 64]
+        # 通过view方法把前两维 合并成 行 ——> [64*16, 12, 64] = [1024, 12, 64]
+        # index_copy_0(dim=0,idx,k)  ———— scatter写入
+        # 语义：target[idx[i]]=source[i]   这里source就是k
+        # idx[i] 是第 i 个 token 的物理行号，k[i] 是第 i 个 token 的 [H, D] ———— index_copy_ 把 k[i] 写到第 idx[i] 行
+        # 池子一共有1024行可以写，但M4 的 prefill 最多S=441，所以写不满
+        self.k[layer].view(-1, self.H, self.D).index_copy_(0, idx, k)  
         self.v[layer].view(-1, self.H, self.D).index_copy_(0, idx, v)  
-
-
-
+        '''
+            比如：这里k的每个元素都是[12,64]
+            idx = [48, 49, 112, 116]（4 个 token），k 是 [4, 12, 64...]
+            k[0] → 写到 target 第 48 行
+            k[1] → 写到 target 第 49 行
+            k[2] → 写到 target 第 112 行
+            k[3] → 写到 target 第 116 行
+            一次 kernel 完成 4 次写入——不是 4 次 __setitem__
+        '''
+        
     def gather_run(self, layer, idx):
-        kf = self.k[layer].view(-1, self.H, self.D)
-        vf = self.v[layer].view(-1, self.H, self.D)
+        # 把池子看成1024行 * [H,D]
+        kf = self.k[layer].view(-1, self.H, self.D)                     # [1024, 12, 64]
+        vf = self.v[layer].view(-1, self.H, self.D)                     # [1024, 12, 64]
+
+        # index_select(dim=0,dix)
+        # 语义：result[i]=target[idx[i]]，和index_copy_相反
+        # index_select 返回 [len, H, D]（每行一个 token)
+        # transpose(0, 1) 换到 [H, len, D] ———— 和 HF 的 [B, H, S, D] 去掉 batch 后一致
+        # transpose返回的是 view，不连续的
         k = kf.index_select(0, idx).transpose(0, 1).contiguous()
         v = vf.index_select(0, idx).transpose(0, 1).contiguous()
-        return k, v
+        return k, v     #  [H, len, D]
 
 
 
