@@ -45,6 +45,10 @@ class PagedState:
         self.table = []                                             # 本请求用到的块号，按顺序
         self.n = 0                                                  # 已写入池的 token 数
 
+        # M4 优化参数
+        self._idx_new = None        # 本步新 token 的行号 [s_new]，12 层复用
+        self._idx_all = None        # [0, n) 全部 token 的行号 [n]，decode 的 gather 用
+
     def append(self, layer, k_new, v_new):
         """k_new/v_new: [H, s_new, D]，把新增的 token 追加进池"""
         # prefill（step 0）时 s_new = prompt_len，decode 时 s_new = 1
@@ -64,20 +68,50 @@ class PagedState:
             if need > 0:
                 self.table += self.alloc.allocate(need)         # += 就是 table.extend()
 
-        # 把 s_new 个 token 逐个写进池
-        for j in range(s_new):
-            t = start + j                                       # 整个序列的第几号 token
-            blk = self.table[t // BLOCK_SIZE]
-            off = t % BLOCK_SIZE
-            # 一样的省略了:   k_new[:, j, :]  
-            # 取这一步的所有新token的K/V，s_new 个 token，每个都是[H, D]
-            self.pool.write_token(layer, blk, off, k_new[:, j], v_new[:, j])
+        # # 把 s_new 个 token 逐个写进池
+        # for j in range(s_new):
+        #     t = start + j                                       # 整个序列的第几号 token
+        #     blk = self.table[t // BLOCK_SIZE]
+        #     off = t % BLOCK_SIZE
+        #     # 一样的省略了:   k_new[:, j, :]  
+        #     # 取这一步的所有新token的K/V，s_new 个 token，每个都是[H, D]
+        #     self.pool.write_token(layer, blk, off, k_new[:, j], v_new[:, j])
+
+        if s_new == 1:      
+            t = start
+            self.pool.write_token(layer,
+                                  self.table[t // BLOCK_SIZE], t % BLOCK_SIZE,
+                                  k_new[:, 0], v_new[:, 0]) 
+
+        else:
+            if layer == 0:
+
+            # M4优化写法：
+                # 索引全局共享，只在 layer 0 算一次
+                tab = torch.tensor(self.table, dtype=torch.int64, device = self.pool.k[0].device)     # 块数
+
+                t_new = torch.arange(start, start + s_new, device=tab.device)           # [s_new]
+                self._idx_new = tab[t_new // BLOCK_SIZE] * BLOCK_SIZE + (t_new % BLOCK_SIZE)
+
+                t_all = torch.arange(0, start + s_new, device = tab.device)             # [n_new]
+                self._idx_all = tab[t_all // BLOCK_SIZE] * BLOCK_SIZE + (t_all % BLOCK_SIZE)
+
+            # 12 层都走到这里，复用上面算好的索引
+            self.pool.write_run(layer,
+                                self._idx_new,
+                                k_new.transpose(0,1),
+                                v_new.transpose(0,1))
+
         
 
     def gather(self, layer):
         """取回本层全部 K/V：[H, n, D]（调用前 self.n 必须是更新后的值）"""
         # 直接复用 M3a 的 pool.gather ———— self.n 此时已经是“当前总 token 数”
-        return self.pool.gather(layer, self.table, self.n)
+        if self._idx_all is None or self._idx_all.numel() != self.n:
+            tab = torch.tensor(self.table, dtype=torch.int64, device=self.pool.k[0].device)
+            t_all = torch.arange(0, self.n, device=tab.device)
+            self._idx_all = tab[t_all // BLOCK_SIZE] * BLOCK_SIZE + (t_all % BLOCK_SIZE)
+        return self.pool.gather_run(layer, self._idx_all)
 
 
 def patch_attention(model, state):

@@ -1,3 +1,4 @@
+from __future__ import annotations              # 这代码必须在所有代码qian'm
 """M4：把引擎的 TTFT / TPOT / 吞吐 三个指数量出来。
 
 复用 M3b-2 的引擎（`m3_paged_kernel.py`），只加计时与报表，不改任何计算。
@@ -16,7 +17,44 @@
     python engines/m4_metrics.py --mult 40  # 只跑 S=441 那档
 """
 
-from __future__ import annotations
+'''
+    优化前数据：
+        档	        实现	        TTFT	    TPOT	    吞吐	            结论
+        S=12	    HF cache	    5.22 ms	    4.70 ms	    219 tok/s	        —
+        S=12	    我们	        8.59	    5.31	    176	                慢：TTFT +3.4ms，TPOT +0.6ms/步
+        S=441	    HF cache	    6.94 ms	    4.31 ms	    227 tok/s	        —
+        S=441	    我们	        130.63	    5.50	    83.7	            慢：TTFT +124ms（灾难），TPOT +1.2ms/步
+    
+    TTFT=130.63ms
+    慢的原因：prefill 的 gather 在 Python 循环里做了 10584 次 select（12 层 × 441 token × 2 次 K/V），
+            加上 sdpa 和 append 的开销，总共 130 ms。HF 的 prefill 一次 sdpa 就搞定 ———— prefill 的 k/v 本来连续，不需要 gather
+            prefill 的 k/v 本来就是连续的，但我的实现强迫它“写进分页池再 gather 回来” ———— 多了一次不必要的往返
+
+            同时 append 也是 12 层 × 441 token × 2 次，比 gather 还大
+        append 441次 python 循环
+        def append(self, layer, k_new, v_new):
+            s_new = k_new.shape[1]                 # 441（prefill）
+
+            for j in range(s_new):                 # 循环 441 次
+                t = start + j                      # 全局 token 序号
+                blk = self.table[t // BLOCK_SIZE]  # 逻辑页 → 物理块
+                off = t % BLOCK_SIZE               # 页内偏移
+                self.pool.write_token(layer, blk, off, k_new[:, j], v_new[:, j])
+        每次 write_token里：
+            self.k[layer][blk, off] = k_tok    # 一次 __setitem__
+            self.v[layer][blk, off] = v_tok    # 又一次 __setitem__
+        共882次__setitem__，12层10584次，每一次都是 Python 解释器 → PyTorch dispatch → 边界检查 → CUDA kernel 启动 → 写入 → 返回——~7~10 μs，大部分是 CPU 开销
+    改：
+        池子可以被看成  1024 行 × [H, D]  的二维表
+        self.k[layer]    # [N_BLOCKS, BLOCK_SIZE, H, D] = [64, 16, 12, 64] 
+        前两维是 块号 * 页内偏移 ————  64 块 × 16 位置 = 1024 个槽，把前两维压扁成一维[1024, 12, 64]
+        通过一次kernel并行操作，把441个token写到各自的441行，而不是441次python调用
+        
+        
+        prefill 不走 gather，直接用c_attn输出的连续k/v算spda，同时写进池
+'''
+
+
 
 import argparse
 import os
