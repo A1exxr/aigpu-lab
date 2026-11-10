@@ -222,3 +222,38 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+'''
+        输入：hidden_states [1, 1, 768]（新 token）
+        ↓ c_attn
+        qkv [1, 1, 2304]
+        ↓ split
+        q, k, v 各 [1, 1, 768]
+        ↓ view + transpose
+        q, k, v 各 [1, 12, 1, 64]
+        ↓
+        state.append(layer_idx, k[0], v[0])     ← KV 写进池
+        state.n += 1                             ← 推进
+        ↓
+        （layer 0 时）刷新 tab_t / lens_t        ← 页表搬上 GPU
+        ↓
+        q[:, :, 0, :] * scaling → [1, 12, 64]   ← 取唯一 query，乘 1/√D
+        ↓
+        mod.paged_attn_split(q, pool.k, pool.v, tab_t, lens_t)
+        ↓ kernel 内部：
+        │   for t in 0..n-1:
+        │       blk = tab_t[0][t//16]
+        │       off = t % 16
+        │       score = dot(q, pool.k[blk][off]) * scaling
+        │   softmax(scores) @ V
+        ↓
+        out [1, 12, 64]
+        ↓ unsqueeze(1)
+        out [1, 12, 1, 64]
+        ↓ transpose + reshape
+        out [1, 1, 768]
+        ↓ c_proj
+        out [1, 1, 768]                         ← 和输入同形，可以接 residual/MLP
+
+'''

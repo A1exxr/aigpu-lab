@@ -22,7 +22,8 @@ bench 里这些是 `torch.randn` 造的假数据；真实系统里，`block_tabl
 | **M2** | 手写 KV cache（不再重算历史） | 同上逐位一致 + 每步耗时随 S **不再线性增长** | ✅ 已通过 |
 | **M3a** | 分页 KV 池 + block_table（attention 仍由 HF 算） | 8 步 × 12 层 K/V 与 HF **逐位一致** | ✅ 已通过 |
 | **M3b-1** | cache 全自己管：池取 K/V + 自己算 attention（仍是 PyTorch） | 8 步 greedy token 与 M2 **完全一致** | ✅ 已通过 |
-| M3b-2 | 把 SDPA 换成 `paged_attn_split` kernel（fp16） | token ≥19/20 + 单步耗时对比 HF attention | 待做 |
+| **M3b-2** | 把 SDPA 换成 `paged_attn_split` kernel（fp16） | token ≥19/20 + 单步耗时对比 HF attention | ✅ 已通过（0.93×，S=13） |
+| **M4** | 分页 KV 读写改成索引 kernel + 报 TTFT/TPOT/吞吐（`m4_metrics.py`） | token 20/20 + TTFT ≤ 25 ms | ✅ 已通过（TTFT 120.13 → 7.37 ms） |
 
 ## 怎么跑
 
@@ -117,3 +118,48 @@ M3b-1 8 步 greedy token 与 M2 完全一致: True              ← cache 换掉
 - 不做 beam search、不做 batch>1 的调度（M3 之后再谈）
 - 不复刻 vLLM：不碰 prefix caching、preemption、chunked prefill
 - 不追求比 HF 快多少——先要"对得上"，再谈"快多少"
+
+## M4 的实测结果（RTX 4060 Laptop，gpt2 124M fp16，prompt 441 token，生成 20 步）
+
+3 轮交替测量（HF / 我们 各 3 轮，丢弃第 1 轮冷启动，取中位数）：
+
+| 指标 | 改前 | 改后 | HF 参考 |
+|---|---|---|---|
+| TTFT | 120.13 ms | **7.37 ms**（7.18–7.39） | 7.33–7.87 |
+| TPOT | 4.73 ms | **4.67 ms**（4.67–5.04） | 4.06–4.38 |
+| 吞吐 | 94.4 tok/s | **204.2 tok/s** | 223–234 |
+| 总耗时 | 212 ms | **96.1 ms** | 86.4 ms |
+| token 一致 | 20/20 | 20/20 | — |
+
+## M4 改了什么（以及为什么这么改）
+
+M3b-2 的 append/gather 是**逐 token 的 Python 循环**：
+
+```python
+# 改前：append 每层 441 次调用，每次 2 次 slice-assign → 全模型 10 584 次
+for j in range(s_new):
+    self.pool.write_token(layer, blk, off, k_new[:, j], v_new[:, j])
+
+# 改后：每层一次 index_copy_ → 全模型 24 次
+self.pool.write_run(layer, idx, k_new.transpose(0, 1), v_new.transpose(0, 1))
+```
+
+```python
+# 改前：gather 逐 token 索引 + stack(441 个 [H,D])
+k = torch.stack(ks, dim=1)
+
+# 改后：一次 index_select
+k = kf.index_select(0, idx).transpose(0, 1).contiguous()
+```
+
+- 关键观察：池里一层 `[64, 16, 12, 64]` 摊平就是 `[1024, 12, 64]`，**每个 token 占一行**，
+  于是"把 S 个 token 写进各自的块"就是一次行索引 scatter。
+- `idx` 与层无关，**只在 layer 0 算一次**，12 层复用。
+- decode（`s_new == 1`）走回原来的直写：24 次 `index_copy_(1 行)` 比 24 次 slice-assign 贵约 0.2 ms/步。
+
+**结论：瓶颈是 Python 调用次数（一次 prefill 约 15 000 次），不是拷贝字节数。**
+往返本身不贵——B′（prefill 不 gather，直接用连续 K/V）最终**没有做**，因为已经把 TTFT 压到 HF 以下。
+
+**记账不做**：decode 每步仍比 HF 慢 0.52 ms（19 步共 9.7 ms），来源是
+12 层各一次 pybind 调用 + `paged_attn_split` 的寻址开销。要消掉需要 CUDA Graph 捕获
+或把 12 层合成一个 kernel，成本高，记在账上不排期。

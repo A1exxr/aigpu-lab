@@ -125,6 +125,34 @@ class KVPool:
         v = torch.stack(vs, dim=1)
         return k, v
 
+
+    '''新增两个方法，优化M4
+        write_run 和 gather_run
+    '''
+    def write_run(self, layer, idx, k, v):
+        '''
+            prefill 一批 token 一次性写进池
+
+        idx: [len] int64 —— 每个 token 在「摊平后的一维坐标」上的行号
+             行号 = 物理块号 * BLOCK_SIZE + 块内偏移
+
+        k/v: [len, H, D] —— 本步新算出来的 K/V（已按 token 排在前面）
+
+        '''
+        self.k[layer].view(-1, self.H, self.D).index_copy_(0, idx, k)  # [N_BLOCKS*BLOCK_SIZE, H, D]
+        self.v[layer].view(-1, self.H, self.D).index_copy_(0, idx, v)  
+
+
+
+    def gather_run(self, layer, idx):
+        kf = self.k[layer].view(-1, self.H, self.D)
+        vf = self.v[layer].view(-1, self.H, self.D)
+        k = kf.index_select(0, idx).transpose(0, 1).contiguous()
+        v = vf.index_select(0, idx).transpose(0, 1).contiguous()
+        return k, v
+
+
+
     def nbytes(self):
         return sum(x.numel() * x.element_size() for x in self.k + self.v)
 
