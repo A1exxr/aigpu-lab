@@ -48,7 +48,7 @@ class BlockAllocator:
         ids = self.free[:n]                 # 取前 n 个
         # del是原地修改，所有引用这个 list 的地方都看到变化
         del self.free[:n]                   # 从 free 里移除
-        # update()是批量添加，接受一个可迭代对象，把里面每个元素都加进去；add() 只加一个元素
+        # update()是批量添加——接受一个可迭代对象，把里面每个元素都加进去；add() 只加一个元素
         self.used.update(ids)               # 加到 used，存的是具体的块号
         return ids
 
@@ -67,14 +67,15 @@ class BlockAllocator:
 # ---------------------------------------------------------------- 池
 # 池 管 KV存哪里
 # KVPool 只管“KV 张量”——不关心谁在用哪块，只负责“给我块号+偏移，我读写”
-# KVPool(...) 分配 75 MB（64 块 × 16 位置 × 12 层 × 12 头 × 64 维 × 2 × 4B）
 class KVPool:
     """布局与 kernel 完全一致：每层两块 [N_BLOCKS, BLOCK_SIZE, H, D]"""
-    def __init__(self, n_layers, n_heads, head_dim, dtype=DTYPE):
+    def __init__(self, n_layers, n_heads, head_dim, dtype=DTYPE, n_blocks=None):
         self.H, self.D, self.BS = n_heads, head_dim, BLOCK_SIZE
 
         # (64个物理块，每块装16个token，12个头，每个头64维)
-        shape = (N_BLOCKS, BLOCK_SIZE, n_heads, head_dim)
+        # M5：块数可由调用方给（多请求共享一个池）；不传时退回 M3/M4 的 64
+        self.n_blocks = N_BLOCKS if n_blocks is None else n_blocks
+        shape = (self.n_blocks, BLOCK_SIZE, n_heads, head_dim)
 
         # gpt2有12层，每层有自己的 attention，每层的 K/V 是独立的
         # attention 是逐层算的，第0层的 attention 只需要第0层的 K/V
@@ -100,11 +101,7 @@ class KVPool:
         
 
     def gather(self, layer, block_table, length):
-        """按 block_table 把分散在物理块里前 length 个 token 的k/v 收集回一个连续张量 [H, length, D]（注意维序）
-            但收集成逻辑连续的张量，是一次全量拷贝，n越大，拷贝越贵
-            每层 attention 之前都调，attention 需要“逻辑连续”的 K/V ———— q @ Kᵀ 要求 K 的序列维按 token 顺序排好
-        """
-        # length 为 当前实际写入了多少个 token
+        """按 block_table 把前 length 个 token 的 k/v 拼回 [H, length, D]（注意维序）"""
         # 按 token 序号 t=0..length-1：
         # blk = block_table[t // BLOCK_SIZE]，off = t % BLOCK_SIZE
         # 取 self.k[layer][blk, off] → 形状 [H, D]，最后 stack 成 [H, length, D]
@@ -121,58 +118,9 @@ class KVPool:
         # 逻辑坐标的映射是确定的，可预测的，对应关系没变
         # ks[0][0,0]（值 1）永远是 result[0,0,0]    ks[1][0,0]（值 5）永远是 result[0,1,0]
         # 因为要和 HF cache 的 [H, S, D] 维度顺序对齐
-        k = torch.stack(ks, dim=1)          # gather返回的k v是没有batch维度的
+        k = torch.stack(ks, dim=1)
         v = torch.stack(vs, dim=1)
         return k, v
-
-
-    '''新增两个方法，优化M4
-        write_run 和 gather_run
-    '''
-    def write_run(self, layer, idx, k, v):     
-        '''
-            prefill 一批 token 一次性写进池
-
-        idx: [len] int64 —— 每个 token 在「摊平后的一维坐标」上的行号
-             行号 = 物理块号 * BLOCK_SIZE + 块内偏移
-
-        k/v: [len, H, D] —— 本步新算出来的 K/V（已按 token 排在前面）
-
-        '''
-        # scatter：一批 token 一次写进池
-        # self.k[layer] 形状为[N_BLOCKS, BLOCK_SIZE, H, D] = [64, 16, 12, 64]
-        # 通过view方法把前两维 合并成 行 ——> [64*16, 12, 64] = [1024, 12, 64]
-        # index_copy_0(dim=0,idx,k)  ———— scatter写入
-        # 语义：target[idx[i]]=source[i]   这里source就是k
-        # idx[i] 是第 i 个 token 的物理行号，k[i] 是第 i 个 token 的 [H, D] ———— index_copy_ 把 k[i] 写到第 idx[i] 行
-        # 池子一共有1024行可以写，但M4 的 prefill 最多S=441，所以写不满
-        self.k[layer].view(-1, self.H, self.D).index_copy_(0, idx, k)  
-        self.v[layer].view(-1, self.H, self.D).index_copy_(0, idx, v)  
-        '''
-            比如：这里k的每个元素都是[12,64]
-            idx = [48, 49, 112, 116]（4 个 token），k 是 [4, 12, 64...]
-            k[0] → 写到 target 第 48 行
-            k[1] → 写到 target 第 49 行
-            k[2] → 写到 target 第 112 行
-            k[3] → 写到 target 第 116 行
-            一次 kernel 完成 4 次写入——不是 4 次 __setitem__
-        '''
-        
-    def gather_run(self, layer, idx):
-        # 把池子看成1024行 * [H,D]
-        kf = self.k[layer].view(-1, self.H, self.D)                     # [1024, 12, 64]
-        vf = self.v[layer].view(-1, self.H, self.D)                     # [1024, 12, 64]
-
-        # index_select(dim=0,dix)
-        # 语义：result[i]=target[idx[i]]，和index_copy_相反
-        # index_select 返回 [len, H, D]（每行一个 token)
-        # transpose(0, 1) 换到 [H, len, D] ———— 和 HF 的 [B, H, S, D] 去掉 batch 后一致
-        # transpose返回的是 view，不连续的
-        k = kf.index_select(0, idx).transpose(0, 1).contiguous()
-        v = vf.index_select(0, idx).transpose(0, 1).contiguous()
-        return k, v     #  [H, len, D]
-
-
 
     def nbytes(self):
         return sum(x.numel() * x.element_size() for x in self.k + self.v)
@@ -244,7 +192,7 @@ def main():
 
             # ---- 2) 把这一步的 k/v 照抄进池
             # k_tok 和 v_tok 的 block_id 和 offset 是通过 全局 token 序号 t 映射出来的
-            for layer in range(L):          # 同一个 token 在 12层里的t一样，算出的blk off也一样，但张量不一样，每一层都有一个k/v张量
+            for layer in range(L):
                 k, v = layer_kv(past, layer)        # [B, H, S_all, D]
                 for j in range(n_new):
                     t = n_written + j                     # t是整个序列的第几个token，不是第几个新token，t是包含prompt的

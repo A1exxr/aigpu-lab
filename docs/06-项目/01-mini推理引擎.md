@@ -385,7 +385,8 @@ context_lens = [10, 37, 128, 300]
 | M3b-1 | `engines/m3_paged_attn.py` | **cache 换成自己的池**，attention 仍 SDPA；token 与 HF 完全一致 | ✅ |
 | M3b-2 | 同上 + `paged_attn_split` | **attention 换自研 kernel**；逐 token 一致，端到端 **0.93×**（S=13） | ✅ |
 | **M4** | `engines/m4_metrics.py` | 三个指标能报；分页 KV 读写改成索引 kernel 后 TTFT `120.13 → 7.37 ms`（**16.3×**）、总耗时 `212 → 96.1 ms`（**2.2×**）、吞吐 `94.4 → 204.2 tok/s`、TPOT 4.67 ms，token 20/20 | ✅ |
-| **M5** | `engines/m5_batching.py` | continuous batching：新请求进正在跑的 batch；吞吐 ≥ 串行 × N，且逐 token 一致 | ⬜ **下一个** |
+| **M5** | `engines/m5_batching.py` | continuous batching：`MAX_BATCH=8`、prefill 不塞；吞吐 ≥ 串行 × **2**（目标 4×）、逐序列 token 一致、无块泄漏 | 🔨 **进行中** |
+| M6 | （不改代码）chunked prefill | **明确不做**（理由见 §13.1） | ❌ 不做 |
 | **R1** | `engines/fa_op.py` | 自研 FA 注册成 `torch.ops.aigpu.flash_attn`（`custom_op` + `register_fake` + autograd），`torch.compile` 不 graph break，profiler 里能看到名字 | ⬜ M5 之后 |
 
 **每完成一个 M，就 commit 一次，并在 commit message 里写当次的数字**（这个项目最值钱的就是"每一步都有数"）。
@@ -423,11 +424,52 @@ context_lens = [10, 37, 128, 300]
 | 顺序 | 做什么 | 预计 | 判据 |
 |---|---|---|---|
 | — | ✅ **M4 指标**（2026-11-10 完成）：TTFT 7.37 / TPOT 4.67 / 204.2 tok/s | 已完成 | token 20/20 与 HF 一致 |
-| 1 | **M5 continuous batching**：`m5_batching.py`，新请求插进正在跑的 batch | 3–4 h | 逐 token 一致 + 吞吐对比串行 |
+| 1 | **M5 continuous batching**：`m5_batching.py`，`MAX_BATCH=8`，prefill 不塞 | 3–4 h | 吞吐 ≥ 2×（目标 4×）+ 逐序列 token 一致 + 无块泄漏 |
+| 1.5 | ~~M6 chunked prefill~~ | — | **明确不做**，见 §13.1 |
 | 2 | **R1 注册算子**：`fa_op.py`，`torch.ops.aigpu.flash_attn` | 1.5 h | `torch.compile` 不 graph break + profiler 可见 |
 | 3 | **推理优化（系统层）**：量化 / PD 分离 / 引擎源码，按面试反馈选 | 长期 | 每项都要有一个数 |
 
 **不做**：chunked prefill、preemption、tensor parallel、权重加载格式。理由见 §9——每加一个组件必须能报一个数字，不追功能数量。
 
 **记账不做（M4 遗留）**：decode 每步仍比 HF 慢 0.52 ms（19 步共 9.7 ms），来源是 12 层各一次 pybind 调用 + `paged_attn_split` 的寻址开销；要消掉需要 CUDA Graph 捕获或把 12 层合成一个 kernel，成本高，不排期。
+
+### 13.1 M6（chunked prefill）为什么明确不做
+
+不是“没时间”，是三条硬理由：
+
+1. **要改 kernel，不是接 kernel**。`paged_attn_split` 的签名是 `q[B,H,D]`——每条 query 一行，S 折进 batch 维。chunked prefill 要求 prefill 也按块走分页 attention（`q[B,H,S,D]` + causal mask + 多 query 共享 KV 的 tiling），等于重写一个 kernel。退回 SDPA + gather 也行，但那就是 M3a，分页白做。
+2. **在本机上测不出改善**。它解决的是「prefill 长时间占住 GPU，导致其他请求 TPOT 抖动（P99）」，要测出效果需要并发 + 长 prompt + 混合负载。我们：8 GB 卡、gpt2-124M、prompt 441 token、prefill 只要 7.37 ms。做了报不出数，而本项目的价值就是每一步都有数。
+3. **和 M5 的定位冲突**。M5 是「把 w7 的 kernel 接进系统」，不是「再造一个 kernel」。
+
+面试口径（三句）：
+
+> “chunked prefill 我明确没做。它解决的是 prefill 长时间占住 GPU、导致其他请求 TPOT 抖动的问题，需要 prefill 也走分页 attention。我的 `paged_attn_split` 只支持单 query（`q[B,H,D]`，S 折进 batch），要支持它得重写 kernel 加 S 维和 causal mask——那是另一条线的工作量。而且我这台 8 GB 卡、gpt2、prompt 441 token，prefill 只有 7 ms，做了也测不出改善。”
+
+### 13.2 M5 的判据是怎么来的（不是拍脑袋）
+
+**第一步：单请求 decode 的权重地板**
+- gpt2-124M fp16 权重 = 248 MB，每步 decode 全读一遍
+- 248 MB ÷ 221 GB/s（实测带宽）≈ **1.12 ms**
+- 实测单步 decode **4.67 ms** ⇒ 只有 24% 在读权重，**剩下 3.5 ms 是 12 层 ×（Python + launch + kernel 调用）**
+- 而 decode 时 grid 只有 `B*H*NSPLIT = 48` 个 warp = 1536 线程 = **6 个 block**，卡上 24 个 SM ⇒ **75% 的 SM 闲着**
+
+**第二步：batch=8 的量级**
+- 权重仍只读一次 → 1.12 ms **不随 batch 增长**
+- 12 层 × 1 次调用的 Python 开销也基本不变
+- 增量只有 KV 读：8 个请求 × 441 token 的 KV ≈ 16.3 MB × 8 ≈ 130 MB → **0.6 ms**
+- ⇒ 预计一步 **5–6 ms**，产出 8 个 token
+
+**第三步：比值**
+- 串行 8 请求各 1 token = 8 × 4.67 = **37.4 ms**
+- 批量 ≈ 5–6 ms ⇒ 理论上限 **6–7×**，硬上限 **8×**（线性）
+
+**所以判据**：< 2× 不通过（组 batch 的 Python 开销吃掉了收益）；**≥ 2× 及格**（保守：T(8) 涨到 18 ms 也能过）；**≥ 4× 目标**；> 8× 说明测错。
+
+外部对照：vLLM 的 PagedAttention 论文在同等延迟下报 **2–4×** 吞吐（对比 FasterTransformer / Orca，SOSP'23，[arXiv:2309.06180](https://arxiv.org/abs/2309.06180)）。我们模型小、单卡单进程，上限比它高，但下限用 2× 是合理的。Orca 那个 36.9× 是 GPT-3 175B 多卡，不适用。
+
+### 13.3 M5 骨架的状态（2026-11-10）
+
+- `engines/m5_batching.py`：框架已写（`BatchPatcher` 支持 batch 内多请求、`Request`、`Batcher` 骨架、`serial_baseline()`、交替测量与判据打印），留 **3 个 TODO**：`admit()` / `decode_step()` / `run()`
+- 前置改动（已做）：`KVPool(..., n_blocks=)` 支持自定义块数；`PagedState(..., pool=, alloc=)` 支持注入共享池/共享分配器（M3/M4 不传参 = 老行为）
+- 池改成全局共享：`N_BLOCKS_M5 = 256`（4096 token 容量），8 个请求合计约 151 MB
 
