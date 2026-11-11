@@ -72,7 +72,7 @@ class KVPool:
     """布局与 kernel 完全一致：每层两块 [N_BLOCKS, BLOCK_SIZE, H, D]"""
     def __init__(self, n_layers, n_heads, head_dim, dtype=DTYPE, n_blocks=None):
         self.H, self.D, self.BS = n_heads, head_dim, BLOCK_SIZE
-        # M5：块数可由调用方给（多请求共享一个池）；不传时退回 M3/M4 的 64
+        # M5：块数可由调用方给（多请求共享一个池）；不传时退回 M3/M4 默认的 64
         self.n_blocks = N_BLOCKS if n_blocks is None else n_blocks
 
         # (64个物理块，每块装16个token，12个头，每个头64维)
@@ -83,6 +83,7 @@ class KVPool:
         # 所以池里要存 12层 * 2(K和V)个分页张量
         # 分开存，kernel 里每层只读自己的那一个张量
         # self.k是一个列表，里面就是12个张量 ———— 例如：torch.zeros([64, 16, 12, 64]) 第 0 层的 K
+        # 这里把整个池子按照层数，分成了12个张量
         self.k = [torch.zeros(shape, dtype=dtype, device="cuda") for _ in range(n_layers)]      # 等价于 for + append
         self.v = [torch.zeros(shape, dtype=dtype, device="cuda") for _ in range(n_layers)]
 
@@ -146,7 +147,7 @@ class KVPool:
         # 通过view方法把前两维 合并成 行 ——> [64*16, 12, 64] = [1024, 12, 64]
         # index_copy_0(dim=0,idx,k)  ———— scatter写入
         # 语义：target[idx[i]]=source[i]   这里source就是k
-        # idx[i] 是第 i 个 token 的物理行号，k[i] 是第 i 个 token 的 [H, D] ———— index_copy_ 把 k[i] 写到第 idx[i] 行
+        # idx[i] 是第 i 个 token 的物理行号，k[i] 是第 i 个 token 的 [H, D] ———— index_copy_ 沿着第 0 维 把 k[i] 写到第 idx[i] 行
         # 池子一共有1024行可以写，但M4 的 prefill 最多S=441，所以写不满
         self.k[layer].view(-1, self.H, self.D).index_copy_(0, idx, k)  
         self.v[layer].view(-1, self.H, self.D).index_copy_(0, idx, v)  
