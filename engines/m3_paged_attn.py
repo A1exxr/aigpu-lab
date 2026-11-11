@@ -56,7 +56,7 @@ class PagedState:
         s_new = k_new.shape[1]      # 这一步新产生几个 token
         
         # larye 0 时，self.n是旧值(这一步之前的总数)，这里要区分 层layer 和 步step
-        # layer 0 是每步forward里面的第0层(12层模型的第1层)
+        # layer 0 是每步 forward 里面的第 0 层(12层模型的第1层)
         # step 0 是整个生成过程的第0步，也就是prefill
         # layer 1+ 时，self.n已经被外部推进去，是新值
         start = self.n if layer == 0 else self.n - s_new    
@@ -69,13 +69,11 @@ class PagedState:
             if need > 0:
                 self.table += self.alloc.allocate(need)         # += 就是 table.extend()
 
-        # # 把 s_new 个 token 逐个写进池
+        # # 把 s_new 个 token 逐个写进池；
         # for j in range(s_new):
         #     t = start + j                                       # 整个序列的第几号 token
         #     blk = self.table[t // BLOCK_SIZE]
         #     off = t % BLOCK_SIZE
-        #     # 一样的省略了:   k_new[:, j, :]  
-        #     # 取这一步的所有新token的K/V，s_new 个 token，每个都是[H, D]
         #     self.pool.write_token(layer, blk, off, k_new[:, j], v_new[:, j])
 
         # M4优化写法：
@@ -84,7 +82,7 @@ class PagedState:
             t = start
             self.pool.write_token(layer,
                                   self.table[t // BLOCK_SIZE], t % BLOCK_SIZE,
-                                  k_new[:, 0], v_new[:, 0]) 
+                                  k_new[:, 0], v_new[:, 0])         # k_new/v_new: [H, s_new, D]
 
         # 批量走 write_run
         else:
@@ -96,6 +94,7 @@ class PagedState:
                 # 本步 token 的全局序号  [0, 1, ..., 440]
                 t_new = torch.arange(start, start + s_new, device=tab.device)        
                 # 本步 token 的物理行号  形状也是[441]，但值是具体的物理行号，不是逻辑序号
+                # 具体的物理行号和tab里的页对应的物理块*16 + 块内偏移
                 self._idx_new = tab[t_new // BLOCK_SIZE] * BLOCK_SIZE + (t_new % BLOCK_SIZE)
 
                 # 全部 token 的全局序号  
@@ -217,10 +216,9 @@ def main():
             # position_ids 必须自己给：我们传 past_key_values=None，
             # HF 会认为 没有历史，然后每步位置都从 0 开始，decoder 看到的位置全错，所以要手动设置 真实位置pos(这一步每个token在序列的绝对位置)
             start = state.n
-            # pos是 [1, S] 的整数张量，这一步的 S 个 token，各自在全局序列里排第几号
+            # pos是 [1, S] 的整数张量，这一步的 S 个 token，在全局序列里的绝对位置
             pos = torch.arange(start, start + inp.shape[1], device=cur.device).unsqueeze(0)   # 补 batch 维度
-            o = model(inp, past_key_values=None, use_cache=False,
-                      position_ids=pos)                          # 不再用 HF cache
+            o = model(inp, past_key_values=None, use_cache=False, position_ids=pos)           # 不再用 HF cache
             cur = torch.cat([cur, o.logits[:, -1, :].argmax(-1, keepdim=True)], dim=1)
     my_tokens = cur[0, ids.shape[1]:].tolist()
 

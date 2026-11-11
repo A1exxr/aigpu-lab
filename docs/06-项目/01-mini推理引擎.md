@@ -385,7 +385,7 @@ context_lens = [10, 37, 128, 300]
 | M3b-1 | `engines/m3_paged_attn.py` | **cache 换成自己的池**，attention 仍 SDPA；token 与 HF 完全一致 | ✅ |
 | M3b-2 | 同上 + `paged_attn_split` | **attention 换自研 kernel**；逐 token 一致，端到端 **0.93×**（S=13） | ✅ |
 | **M4** | `engines/m4_metrics.py` | 三个指标能报；分页 KV 读写改成索引 kernel 后 TTFT `120.13 → 7.37 ms`（**16.3×**）、总耗时 `212 → 96.1 ms`（**2.2×**）、吞吐 `94.4 → 204.2 tok/s`、TPOT 4.67 ms，token 20/20 | ✅ |
-| **M5** | `engines/m5_batching.py` | continuous batching：`MAX_BATCH=8`、prefill 不塞；吞吐 ≥ 串行 × **2**（目标 4×）、逐序列 token 一致、无块泄漏 | 🔨 **进行中** |
+| **M5** | `engines/m5_batching.py` | continuous batching：`MAX_BATCH=8`、prefill 不塞；吞吐 4.06×、`B=1` 时与串行逐位一致、无块泄漏 | ✅ **已通过** |
 | M6 | （不改代码）chunked prefill | **明确不做**（理由见 §13.1） | ❌ 不做 |
 | **R1** | `engines/fa_op.py` | 自研 FA 注册成 `torch.ops.aigpu.flash_attn`（`custom_op` + `register_fake` + autograd），`torch.compile` 不 graph break，profiler 里能看到名字 | ⬜ M5 之后 |
 
@@ -424,7 +424,7 @@ context_lens = [10, 37, 128, 300]
 | 顺序 | 做什么 | 预计 | 判据 |
 |---|---|---|---|
 | — | ✅ **M4 指标**（2026-11-10 完成）：TTFT 7.37 / TPOT 4.67 / 204.2 tok/s | 已完成 | token 20/20 与 HF 一致 |
-| 1 | **M5 continuous batching**：`m5_batching.py`，`MAX_BATCH=8`，prefill 不塞 | 3–4 h | 吞吐 ≥ 2×（目标 4×）+ 逐序列 token 一致 + 无块泄漏 |
+| 1 | ~~**M5 continuous batching**~~ ✅ 已完成：8 条并发 **4.06×**（forward 168→27），`B=1` 时 8/8 逐位一致 | 3–4 h | 吞吐 4.06× ≥ 2×；自比 8/8；无泄漏 |
 | 1.5 | ~~M6 chunked prefill~~ | — | **明确不做**，见 §13.1 |
 | 2 | **R1 注册算子**：`fa_op.py`，`torch.ops.aigpu.flash_attn` | 1.5 h | `torch.compile` 不 graph break + profiler 可见 |
 | 3 | **推理优化（系统层）**：量化 / PD 分离 / 引擎源码，按面试反馈选 | 长期 | 每项都要有一个数 |
@@ -473,3 +473,22 @@ context_lens = [10, 37, 128, 300]
 - 前置改动（已做）：`KVPool(..., n_blocks=)` 支持自定义块数；`PagedState(..., pool=, alloc=)` 支持注入共享池/共享分配器（M3/M4 不传参 = 老行为）
 - 池改成全局共享：`N_BLOCKS_M5 = 256`（4096 token 容量），8 个请求合计约 151 MB
 
+### 13.4 M5 的结果与判据（2026-11-11）
+
+| 实现 | 总耗时(ms) | 吞吐(tok/s) | forward 次数 |
+|---|---|---|---|
+| 串行 | 861.4 | 185.7 | 168 |
+| 批量 | 211.9 | 755.0 | 27 |
+| 加速比 | **4.06×** | 4.07× | 少 6.2× |
+
+无块泄漏（跑完 0 块），峰值 17 / 256 块。
+
+**7/8 token 一致的定性过程**（先定性，再定判据，不许倒推）：
+
+1. 旧脚本两次自比 0/8 → 说明判据本身不可信；改成「每次跑重建池/分配器/patcher」后自比 **8/8**、**8/8** ⇒ 两条路径各自确定。
+2. `MAX_BATCH=1`（同形状）→ 与串行 **8/8** 逐位一致 ⇒ 索引/块表/kernel 寻址正确。
+3. `MAX_BATCH=8` → 7/8，唯一分歧在第 13 步且第 14 步收敛 ⇒ 归因 fp16 累加顺序随 batch 形状改变。
+
+**判据（已替代“逐序列 token 一致”）**：硬判据 = `B=1` 逐位一致 + 两条路径自比 8/8 + 无泄漏 + 峰值 ≤ 容量；性能 = ≥ 2×（目标 4×）；`B=8` 的逐 token 一致率作为**披露项**，不是判据。
+
+数值细节与面试口径见 `engines/README.md` 的「M5 的实测结果」与「M5 的判据为什么这么定」两节。
