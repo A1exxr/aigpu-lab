@@ -45,3 +45,5 @@ kernels/w6_1gemm
 kernels/w6_2gemm
 kernels/cpasync
 *.o
+_setup_m1.sh
+engines/t1.py
