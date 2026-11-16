@@ -2,7 +2,12 @@ import torch
 import triton
 import triton.language as tl
 
+'''
+    FA2 的并行度 + FA1 的 online softmax 数学
 
+    FA1：grid 只有 B*H  如果 B*H 小于 SM 数（比如 B=H=1 时只有 1 个 program），GPU 基本跑不满
+    这版 grid = (triton.cdiv(S, Block_m), B * H)，program数量为 Q块数量 * B*H，并行度翻倍，S 越长提升越明显
+'''
 @triton.jit
 def _flash_attn_kernel(Q, K, V, O,
                        stride_qh, stride_qm, stride_qd,
@@ -15,15 +20,16 @@ def _flash_attn_kernel(Q, K, V, O,
     pid_ph = tl.program_id(1)
 
     offs_m = pid_m * Block_m + tl.arange(0, Block_m)        # 当前 Q 块的行号
-    offs_d = tl.arange(0, D)                                # # (D,)        所有特征维
+    offs_d = tl.arange(0, D)                                # (D,) 所有特征维
 
-    # 加载 Q 块 ———— 基址 + pid_bh 个 (b,h) + 行偏移 + 列偏移
+    # 加载 Q 块 ———— 基址 + pid_bh 个 (b,h) + 行偏移 + 列偏移 
+    # 当 S 不是 Block_m 的整数倍时，最后一块会多出越界行，越界保护只需要看行，比较offs_m和S，因为D维不分块，永远不越界
     q = tl.load(Q + pid_ph * stride_qh + offs_m[:, None] * stride_qm + offs_d[None,:] * stride_qd, mask=offs_m[:, None] < S, other=0.0)
 
     # 初始化三个状态
     m_i = tl.full(shape=(Block_m,), value=float("-inf"), dtype=tl.float32)      # 到目前为止的最大值
-    l_i = tl.zeros((Block_m,), tl.float32)                                      # 每行 exp 和
-    acc = tl.zeros((Block_m, D), tl.float32)                                    # 每行输出累加器
+    l_i = tl.zeros((Block_m,), tl.float32)                                      # 每行 exp 和(就是分母的累加器)
+    acc = tl.zeros((Block_m, D), tl.float32)                                    # 每行输出累加器(未归一化的累加器，最后除以l_i才得到输出)
 
     # K/V循环
     for start_n in range(0, S, Block_n):                # 串行循环：每个 program 都要走完所有 K/V 块，因为 attention 需要看全部 key
@@ -42,6 +48,7 @@ def _flash_attn_kernel(Q, K, V, O,
 
         # 累加 online softmax版本
         m_new = tl.maximum  (m_i, tl.max(s,1))                      # 新的全局最大值
+        # GPU硬件支持exp2，不支持exp，所以exp就写成 exp2(x * log2(e))
         alpha = tl.exp2((m_i - m_new) * 1.44269504)                 # 旧尺度 ——> 新尺度
         p = tl.exp2((s - m_new[:, None]) *  1.44269504)             # 当前块权重，用新基准计算当前块权重
         # 注意，这里l_i 形状是 (Block_m,)，和alpha一样，不用广播
@@ -50,16 +57,10 @@ def _flash_attn_kernel(Q, K, V, O,
         m_i = m_new                                                 # 最后才更新基准
 
 
-
-
     # 归一化写回，在for循环外面，只需要写一次
     o = acc / l_i[:, None]
     tl.store(O + pid_ph * stride_oh + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od, 
                 o.to(tl.float16), mask=offs_m[:, None] < S)
-
-
-
-
 
 def flash_attn(q, k, v):
     B, H, S, D = q.shape
@@ -76,9 +77,6 @@ def flash_attn(q, k, v):
                              Block_m, Block_n, D=D,     #  D 作为 constexpr 关键字传入
                              num_warps=4, num_stages=2)     
     return o
-
-
-
 
 
 
