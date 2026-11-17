@@ -45,3 +45,7 @@ kernels/w6_1gemm
 kernels/w6_2gemm
 kernels/cpasync
 *.o
+
+# 私有不入库的脚本
+_setup_m1.sh
+engines/t1.py
