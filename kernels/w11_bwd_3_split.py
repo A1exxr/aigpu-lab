@@ -1,6 +1,6 @@
 """w11 FlashAttention 反向 · 台阶 3：拆两 kernel，无 atomic
 
-dk/dv 与 dq 各自独占一维 → 循环里累加进寄存器，结束一次 store；结果逐位可复现。
+dk/dv 与 dq 各自独占一维 → 循环里累加进寄存器，结束一次 store；结果逐位可复现
 """
 
 import math
@@ -16,7 +16,7 @@ from w11_oracle import bwd_ref, fwd, make_inputs
 # 台阶 3：key 维也并行 —— 拆成两个 kernel，各自独占一维
 #   3a _bwd_dkdv : grid=(S//BLOCK_N, B*H)  串行走 query 块 → dk, dv 独占 store
 #   3b _bwd_dq   : grid=(S//BLOCK_M, B*H)  串行走 key   块 → dq    独占 store
-# 没有 atomic。代价：p / ds 要算两遍（约 +50% FLOPs）。
+# 没有 atomic   代价：p / ds 要算两遍（约 +50% FLOPs）
 # ============================================================
 
 @triton.jit
@@ -24,6 +24,7 @@ def _bwd_dkdv(Q, K, V, DO, LSE, DELTA, DK, DV,
               H: tl.constexpr, S: tl.constexpr, D: tl.constexpr,
               scale, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
     # B, H, S, D = 1, 8, 1024, 64
+    # BLOCK_M = BLOCK_N = 64
     pid_n = tl.program_id(0)                    # 0 1 2 ... 15
     bh = tl.program_id(1)                       # 0 1 ... 7   ———— B * H = 8  
     b = bh // H                                 # 0
@@ -37,12 +38,16 @@ def _bwd_dkdv(Q, K, V, DO, LSE, DELTA, DK, DV,
     v = tl.load(V + base + offs_n[:, None] * D + offs_d[None, :])   # (BN, D)
 
     # 两个累加器 —— 形状要和 dk/dv 的“本块”一致
-    acc_dk = tl.zeros((BLOCK_N, D), dtype = tl.float32)        
+    acc_dk = tl.zeros((BLOCK_N, D), dtype = tl.float32)
     acc_dv = tl.zeros((BLOCK_N, D), dtype = tl.float32)
 
-    # 循环步长是 query 块（这一维现在是串行的）。range 的三个参数填全
+    # 循环步长是 query 块（这一维现在是串行的）
     for m in range(0, S, BLOCK_M):
         offs_m = m + tl.arange(0, BLOCK_M)
+        # q、do、lse、delta 每个 query 块都是不一样的
+        # 每个 q 块的 q 当然不一样
+        # lse 和 delta 都是 query 维度的量
+        # do 是 前向输出的梯度，每个query都有自己的一份do，所以每行的query的do也不一样
         q = tl.load(Q + base + offs_m[:, None] * D + offs_d[None, :])     # (BM, D)
         do = tl.load(DO + base + offs_m[:, None] * D + offs_d[None, :])   # (BM, D)
         lse_m = tl.load(LSE + bh * S + offs_m)        # (BM,)
@@ -58,9 +63,6 @@ def _bwd_dkdv(Q, K, V, DO, LSE, DELTA, DK, DV,
         # dv 累加
         acc_dv += tl.dot(tl.trans(p), do, input_precision="ieee")
 
-    # 把 acc_dk / acc_dv 写回 DK / DV（指针形状和 dk/dv 的块一致）
-    # 凡是"行号/token 编号/offs_m/offs_n/offs_k"这类走行方向的索引，都要 [:, None] 竖起来；
-    # 凡是"列号/特征编号/offs_d"这类走列方向的索引，都要 [None, :] 横过来
     tl.store(DK + base + offs_n[:,None] * D + offs_d[None,:], acc_dk)
     tl.store(DV + base + offs_n[:,None] * D + offs_d[None,:], acc_dv) 
 
@@ -112,7 +114,6 @@ def attn_bwd_triton_split(q, k, v, do, lse, delta, BLOCK_M=64, BLOCK_N=64):
 
     # 注意两个 grid 不一样：3a 只切 key，3b 只切 query
     # num_stages=2：默认 3 级时 k+v 各 16 KB × 3 + 中间缓冲 = 114688 B > 上限 101376 B
-    # （E-97 那道账）。降到 2 级后 64 KB + 中间缓冲，刚好装下。
     _bwd_dkdv[(S // BLOCK_N, B * H)](
         q, k, v, do, lse, delta, dk, dv,
         H=H, S=S, D=D, scale=scale, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,

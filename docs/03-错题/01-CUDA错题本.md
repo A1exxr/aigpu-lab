@@ -1,6 +1,6 @@
 # CUDA 错题本
 
-> 读法：**§0 索引**按编号查（90 条，E-01 ~ E-106，有空号）→ **§1–§9 按主题分组**（同类错误放一起）
+> 读法：**§0 索引**按编号查（92 条，E-01 ~ E-108，有空号）→ **§1–§9 按主题分组**（同类错误放一起）
 > → **§10 已答对** → **§11 复习记录** → **§12 待验证清单**。
 > 早期的「原始散记 / 使用协议」已整体搬到同目录 `01-CUDA错题本-散记存档.md`（内容一字未改）。
 
@@ -14,6 +14,10 @@
 1. **只从 🔴/🟡 抽题**。✅ 已连续答对 2 次的不再抽 —— 之前“天天都是那几道”，就是因为抽题池只增不减。
 2. **连续答对 2 次 → 降一级**：🔴 → 🟡 → ✅。降到 ✅ 的不删，挪进 §10 只作回顾。
 3. **新错题按簇归位**（§1–§9），**不再往文件末尾追加**。文件末尾的追加块已整体搬到 `01-CUDA错题本-散记存档.md`。
+
+4. **出题必须带上下文（2026-11-17 定，血的教训）**：每道题必须给出 ① `blockDim` / `grid` ② warp 内**哪一维在变** ③ 每条 lane 的**读写表达式** ④ 数据类型与尺寸 ⑤ 完整的相关代码片段。
+   **禁止两件事**：拿没讲过的新知识当考题（先讲、后考）；只给半截上下文（例如只说"原先 `cols + 2*threads`"却不贴代码）。
+   违例的题当场作废、不计分，且要说明是出题方的错。
 
 **编号规则**：E-xx 递增但不按时间排；同一个坑复发时**沿用原编号**并在「次数」+1，不新开号。
 
@@ -109,6 +113,8 @@
 | `E-104` | split-L 的动机是 decode 并行度不足，判据 = `dram ≥ 90%` + SM 打满 | 性能判断与调参 | 1 |
 | `E-105` | tiling 的 `k0` 与寄存器分块的 `r/c` 是两层，不能相加 | 并行映射与索引 | 1 |
 | `E-106` | M4：慢在 Python **调用次数**（15 876 次 × 7 µs），不在字节数 | 性能判断与调参 | 1 |
+| `E-107` | online softmax：`p` 是向量不是标量；`acc` 的缩放不能和 `+=` 混写 | 归约与同步 | 1 |
+| `E-108` | `fmaf`（乘加）≠ `fmaxf`（取max）；`alpha = exp(m - m_new)` 方向不能反 | 归约与同步 | 1 |
 
 **每个簇最容易错的那一点**
 
@@ -719,7 +725,15 @@ E-101（新增，🔴 E-15 族第 2 次）`__shfl_down_sync` 的 offset 起点�
   for (int offset = blockDim.x / 2; offset > 0; offset >>= 1)   // ❌ blockDim.x=256 → 起点 128
       acc += __shfl_down_sync(0xffffffff, acc, offset);
   ```
-- **为什么错**：`__shfl_down_sync` 只在**一个 warp（32 条 lane）内部**通信。`offset = 128` 意味着「取 lane+128 的值」，越界的 lane 不参与，硬件直接返回**自己的值**。于是 8 轮循环全是空转，`acc` 一直是每个线程自己的那个数；lane 0 写出去的是它自己的值，**不是 warp 和**。
+- **为什么错**：`__shfl_down_sync` 只在**一个 warp（32 条 lane）内部**通信。合法 offset 只有 16/8/4/2/1。写 `blockDim.x/2` 时 `offset` 依次取 **128, 64, 32, 16, 8, 4, 2, 1，共 8 轮**，前 3 轮无效。
+- **2026-11-12 复测补正（关键）**：越界时 PTX 规定「**源 lane 超出范围 → 返回调用者自己的值**」，所以 `acc += __shfl_down_sync(..., 128)` 等价于 `acc = acc + acc`，**acc 每轮翻一倍**：
+  ```
+  offset=128 → acc *= 2
+  offset=64  → acc *= 2
+  offset=32  → acc *= 2
+             ⇒ 进有效归约前 acc 已放大 8 倍
+  ```
+  所以症状不是「空转、值不变」，而是**逐轮倍增、整体偏大**，且不报错。（本条第 1 版把这里写成「8 轮全是空转」，是错的，2026-11-12 修正。）
 - **正解**：warp 内归约的 offset **恒从 16 开始**，与 `blockDim.x` 无关：
   ```cuda
   for (int offset = 16; offset > 0; offset >>= 1)
@@ -743,6 +757,76 @@ E-101（新增，🔴 E-15 族第 2 次）`__shfl_down_sync` 的 offset 起点�
   ```
 - **两个轮数别混**：级别 1 是 `log2(32) = 5` 轮（warp 内固定）；级别 2 是 `log2(warp 数)` 轮（256 线程 → 8 warp → 3 轮）。
 - **记忆**：**shuffle 只在 warp 内，所以起点永远是 16；`blockDim.x/2` 只属于「共享内存树形归约」。**
+
+
+E-107（新增，🔴）online softmax 的更新写成「向量当标量 + 重复累加」
+
+<sub>出处：2026-11-12 自测 Q3（默写 online softmax 四行）</sub>
+
+- **我出的题**：只写内层循环里 `m / alpha / l / acc` 的四行更新（不含 QK、不含 shuffle 合并）。
+- **用户答**：
+  ```cuda
+  float m = fmaxf(m_old, s);              // ✗ s 是 Bc 个分数，要 max over jj
+  float alpha = __expf(m - m_old);        // ✓
+  p = sum(__expf(s - m));                 // ✗ p 必须留成向量 p[jj]
+  li = li * alpha + p;                    // ✓ 结构对
+  acc += acc * alpha + p * v;             // ✗✗ 既重复累加，又把 p 当标量
+  ```
+- **三个错各自的性质**：
+  1. `m = max(m_old, s)`——把**向量**当**标量**：`s[Bc]` 要整块取 max，漏了就是对某一列取 max，后面全错。
+  2. `p = sum(exp(s-m))`——把**向量压成标量**：`acc[d] += p[jj]*v[jj][d]` 需要每一列的权重，压成和之后 PV 加权全丢。
+  3. `acc += acc * alpha + ...`——**重复累加**：等价 `acc = 2*alpha*acc + ...`。正确是赋值 `acc[d] = acc[d]*alpha + Σ p[jj]*v[jj][d]`，或先 `acc[d] *= alpha` 再 `acc[d] += ...`。
+- **正确写法（顺序唯一要求：`acc` 的缩放只做一次）**：
+  ```cuda
+  float m_new = m;
+  for (jj) m_new = fmaxf(m_new, s[jj]);
+  float alpha = __expf(m - m_new);
+  float l_new = l * alpha;
+  for (jj) {
+      float p = __expf(s[jj] - m_new);          // 只算一次
+      l_new += p;
+      for (d) acc[d] += p * h2f(Vs[jj][d0 + d]);
+  }
+  for (d) acc[d] *= alpha;                      // 缩放放循环后也可以
+  m = m_new; l = l_new;
+  ```
+- **记忆**：**`p` 是向量不是标量；`acc` 的缩放是赋值的语义，不能和 `+=` 混写。**
+- **注**：这条与 E-65（online softmax 四行漏了 `acc*alpha`）是同一族的第 2 次，详见 `kernels/w12_fa2.cu` 的 TODO 3。
+- **状态**：🔴 待验证
+
+
+E-108（新增，🔴 E-107 同族第 3 次）online softmax 写成 `fmaf` / alpha 方向反 / 把数组当标量
+
+<sub>出处：2026-11-13 自测 Q3（隔 1 天再考同一题，仍未写对）</sub>
+
+- **用户答**：
+  ```cuda
+  float m_new = fmaf(m, s);
+  float alpha = __expf(m_new - m);
+  l = l * alpha + __expf(s - m_new);
+  acc = acc * alpha + sum(__expf(s - m_new) * v);
+  ```
+- **四处错**：
+  1. **`fmaf(m, s)`** —— `fmaf` 是 `fma(a,b,c)=a*b+c` 的**三参数**乘加函数；这里要的是 `fmaxf` 或循环取 max。名字只差一个字母、语义完全不同（与 E-13 的 `sqrt`/`sqrtf` 同族：编译器会因参数个数报错，但根因是「以为它表示取最大值」）。
+  2. **`alpha = exp(m_new - m)` 方向反了** —— alpha 是「旧 max 相对新 max 的缩放」，必须 `exp(m - m_new)` ≤ 1。写反后 alpha > 1，`l` 与 `acc` 每轮越乘越大，形状不报错、数值爆掉。
+  3. **`s` 与 `acc` 都当成了标量** —— `s` 是 `float s[Bc]`、`acc` 是 `float acc[32]`；`l` 要 `for (jj)` 求和，`acc` 要 `for (d)` 逐维更新。
+  4. **`acc = acc * alpha + ...`** —— 数组不能整体赋值，右侧还是标量表达式。
+- **正确骨架**（同 E-107，背这一段）：
+  ```cuda
+  float m_new = m;
+  for (int jj = 0; jj < Bc; ++jj) m_new = fmaxf(m_new, s[jj]);
+  float alpha = __expf(m - m_new);            // <= 1
+  float l_new = l * alpha;
+  for (int jj = 0; jj < Bc; ++jj) {
+      float p = __expf(s[jj] - m_new);        // 只算一次
+      l_new += p;
+      for (int d = 0; d < 32; ++d) acc[d] += p * h2f(Vs[jj][d0 + d]);
+  }
+  for (int d = 0; d < 32; ++d) acc[d] *= alpha;
+  m = m_new; l = l_new;
+  ```
+- **三个「只看名字会错」的数学函数**：`fmaxf` 取最大（2 参）/ `fminf` 取最小（2 参）/ `fmaf` 乘加（3 参）。
+- **状态**：🔴 待验证（同一题连续两次错 → 改练法：先做「改错题」，再默写）
 
 ## §3 内存层级与访存
 
@@ -1026,6 +1110,16 @@ E-102（新增，🟡 E-15 族）行跨度 32 word → 32 条 lane 同 bank，�
 - 补充：`[64][40]` 时 8 个起点恰好是 `0, 20, 8, 28, 16, 4, 24, 12`（我这次算对了这一问）。
 - **`[64][65]` 为什么更差**：130 B **不是 16 的倍数**，一行的 16 字节向量访存会跨两个 16 B 事务 → 一次访问拆两次 → 有效带宽掉；而且**编译期不报错**，是静默退化（`[32][33]` 慢 41% 就是这类）。
 - **记忆**：**冲突路数 = 32 ÷ 落到的不同 bank 数**；而不同 bank 数 = `32 / gcd(行跨度 word 数, 32)`。
+- **⚠️ 适用前提（2026-11-12 补，重要）**：上面这套「行跨度 / gcd / 行起点 bank」只在 **warp 内 32 条 lane 的地址跨行** 时才有意义（典型写法 `As[lane][c]`、`As[r + lane][c]`）。
+  - 若 32 条 lane 读的是**同一行内的连续元素**（`As[ty][tx]`，`ty = threadIdx.y` 固定、`tx = threadIdx.x` 跑 0..31），地址是连续 32 个 half = 64 B = **16 个 word、16 个连续 bank**，相邻两 half 同字合并 ⇒ **0 冲突**，扇区利用率 100%。此时行跨度、gcd 一律不参与。
+  - 同一块 `half As[64][40]`，两种访问的答案相反：
+
+    | 访问 | lane 地址 | 落在几个 bank | 冲突 |
+    |---|---|---|---|
+    | `As[ty][tx]`（同一行连续） | `20*ty + tx/2` | 16（连续） | **0** |
+    | `As[lane][c]`（跨行同列） | `20*lane + c/2` | 8（`0,20,8,28,16,4,24,12`） | **4 路** |
+
+  - **判读顺序**：① 先看 `blockDim`，确定一个 warp 是哪 32 条线程；② 再看这 32 条 lane 的地址表达式是否跨行；③ 只有跨行才去算 word 跨度与 gcd。
 
 ## §4 精度与单位
 
@@ -2068,12 +2162,14 @@ for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
 - [ ] **E-46** `float sum;` 不初始化，`sum += ...` 会怎样？CUDA 会给默认值吗？
 - [ ] **E-47** kernel 形参写 `const int eps`、host 传 `1e-6`，kernel 里实际收到什么？报错吗？
 - [ ] **E-48** 📘 bench 的 `cpp_signature` 和你的 host 函数不一致时，会在**编译**还是**跑分**阶段暴露？症状是什么？
-- [ ] **E-101** 🔴 **默写**两级归约骨架：warp 内 shuffle 的 offset **从几开始**？为什么不是 `blockDim.x/2`？跨 warp 中转用全局 `out` 会怎样？
-- [ ] **E-102** 🟡 `__shared__ half As[64][64]` 里 32 条 lane 读 `As[r+lane][c]`：写出 bank 公式，**几路冲突**？改成 `[64][40]` 呢？`[64][65]` 为什么更慢？
+- [ ] **E-101** 🔴 **默写**两级归约骨架：warp 内 shuffle 的 offset **从几开始**？为什么不是 `blockDim.x/2`？**越界时返回什么值、`acc` 会变成几倍**？`blockDim.x=256` 时那 8 轮里有几轮无效？
+- [ ] **E-102** 🔴 `__shared__ half As[64][64]` 里 32 条 lane 读 `As[r+lane][c]`：写出 bank 公式，**几路冲突**？改成 `[64][40]` 呢？`[64][65]` 为什么更慢？**换成 32 条 lane 读 `As[ty][tx]`（同一行连续）又几路？为什么这时候行跨度不参与？**（跨行才用 gcd）
 - [ ] **E-103** 🔴 `paged_attn_split` 的 `MAXB` 和 `context_lens` 各是什么？**没有 `context_lens` 会怎样？**
 - [ ] **E-104** 🔴 split-L 到底为谁服务（prefill 还是 decode）？**判据是哪两个 ncu 指标**？merge 额外读写多少字节？
 - [ ] **E-105** 🔴 GEMM tiling：`As[ty][tx]` 从 `A` 的哪里取？`k0` 加在谁身上？寄存器分块的 `r/c` 和 `k0` 是一回事吗？
 - [ ] **E-106** 🔴 M4 为什么慢：441 token 的 prefill 慢 111 ms，是字节数还是调用次数？给个估算。`view(-1,H,D)` 之后一个 token 对应什么？
+- [ ] **E-107** 🔴 online softmax 四行：`p` 是标量还是向量？`acc` 的缩放为什么不能写成 `acc += acc*alpha + ...`？`m` 是对什么取 max？
+- [ ] **E-108** 🔴 `fmaxf` 和 `fmaf` 分别几个参数、干什么？`alpha` 是 `exp(m - m_new)` 还是 `exp(m_new - m)`，为什么必须 ≤ 1？
 **升级规则**：同一题**连续两次**答对 → 标 🟢，移出待验证清单。
 **降级规则**：答对一次后又答错 → 回到 🔴，并新增一条错误记录。
 

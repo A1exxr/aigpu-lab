@@ -92,10 +92,10 @@ def build_kernel():
 @dataclass
 class Request:
     """一个在跑的请求：自己的表、自己的 n、自己生成的 token"""
-    rid: int
-    prompt: torch.Tensor                    # [1, S]
-    state: PagedState
-    tokens: list = field(default_factory=list)
+    rid: int                                # 请求编号 0 1 ... 7
+    prompt: torch.Tensor                    # [1, S]    原始prompt
+    state: PagedState                       # 这个请求的分页状态(table + n + 池引用)
+    tokens: list = field(default_factory=list)      # 已生成的 token
     logits: torch.Tensor = None             # 最后一步的 logits，用来比对
 
     @property
@@ -104,6 +104,7 @@ class Request:
 
 
 # ---------------------------------------------------------------- 接线
+# 12 层 attention 的补丁管理器（支持 B 个请求）
 class BatchPatcher:
     """把 12 层的 attention 换成我们的实现，支持 batch 内多个请求
 
@@ -137,10 +138,11 @@ class BatchPatcher:
             v = v.view(B, S, H, D).transpose(1, 2)
 
             # 每一行 K/V 写进它自己请求的那张表，循环B个请求
+            # self.states 是 bind 时设的 B 个 PagedState
             for i, state in enumerate(self.states):
                 # layer_idx 是第i层
-                state.append(layer_idx, k[i], v[i])     # k[i] 是取第 0 维(batch维)的第 i 个请求的 K [H, S, D]
-
+                state.append(layer_idx, k[i], v[i])     # k[i] 是第 i 个请求的的K(取第 0 维(batch维))  [H, S, D]
+                
             if layer_idx == 0:
                 for state in self.states:
                     state.n += S        # 每请求各推各的
@@ -154,7 +156,7 @@ class BatchPatcher:
                     self.lens_t[i] = state.n
 
             if S > 1:                                       # prefill：单请求，SDPA
-                K, V = self.states[0].gather(layer_idx)     # 从池读回完整 KV
+                K, V = self.states[0].gather(layer_idx)     # 从池读回完整 KV；prefill的B=1，取第0个
                 out = F.scaled_dot_product_attention(q, K.unsqueeze(0), V.unsqueeze(0), is_causal=True, scale=scaling)
                 self.stats["sdpa"] += 1
             else:                                           # decode：B 个请求一起走 kernel
@@ -200,61 +202,82 @@ class Batcher:
         self.pool = pool
         self.alloc = alloc
         self.max_batch = max_batch
-        self.waiting = []               # list[torch.Tensor]，待进入的 prompt
+        self.waiting = []               # list[torch.Tensor]，每个元素都是一个[1,S]的prompt张量
         self.running = []               # list[Request]
         self.finished = []              # list[Request]
-        self.peak_used = 0
+        self.peak_used = 0              # 峰值占用块数
         self.n_fwd = 0                  # 一共做了几次 forward（对比串行用）
         self.next_rid = 0               # 按顺序分配 rid
         self.n_steps = STEPS            # decode_step 用
 
-
+    # admit 只做 prefill
     def admit(self):
-        """把 waiting 里的请求拉进 running（新请求插进正在跑的 batch）"""
+        """把 waiting 里的请求拉进 running（新请求插进正在跑的 batch）
+
+            从 waiting 队列里拉一个请求出来，给它建 PagedState，跑一次 prefill，
+            拿到第一个 token，放进 running
+        """
 
         while self.waiting and len(self.running) < self.max_batch:
-            prompt = self.waiting[0]
-            S = prompt.shape[1]
+            prompt = self.waiting[0]    # prompt 形状是 [1, S]；比如 [[464, 3139, 286, ..., 318]]
+            S = prompt.shape[1]         # 这个 prompt 的 token 数
 
-            # 需要多少块，prefill要取整，再留2块给decode增长
+            # 需要多少块，prefill要取整，再留2块给 decode 增长
+            # prefill 之后还要生成 20 个 token，可能跨页
             need = math.ceil(S / BLOCK_SIZE) + 2
             if self.alloc.n_used + need > self.alloc.n_blocks:
                 break       # 块不够，等别人跑完(M5 不做 preemption)
 
-            # 建一个共享池上的 PagedState
-            n_layer = len(self.pool.k)
+            
+            n_layer = len(self.pool.k)                  # 层数
+            # 建一个共享池上的 PagedState，8个请求共同一个
+            # pool=self.pool 和 alloc=self.alloc，是引用的，因为全局共享 池和分配器
+            # 新建的PagedState对象，只有 table 和 n 是新的
             state = PagedState(n_layer, self.pool.H, self.pool.D, DTYPE,
                                pool = self.pool, alloc = self.alloc)
 
             # prefill 单独一次 forward (B=1)
-            self.patcher.bind([state])
-            pos = torch.arange(0, S, device=prompt.device).unsqueeze(0)
+            self.patcher.bind([state])      # 告诉 patcher 这次只有1个请求 ———— 把这个 state 传给 patcher ———— 算 o 的时候会触发 patched
+            pos = torch.arange(0, S, device=prompt.device).unsqueeze(0)     # pos是[S]的，要补上batch维度  [1, S]
             o = self.model(prompt, past_key_values=None, use_cache=False,
                            position_ids=pos)
 
+            # o.logits形状是[1,S,V]，每个位置的logits
+            # admit是B=1，用[0，-1] 取 batch 0、最后一个位置，[V],切片成 1维，argmax就不需要参数
+            # [:,-1]是所有 batch、最后一个位置，形状是[1, V]，为2维，argmax就要传参数dim=-1
             toks = [int(o.logits[0, -1].argmax())]
+            # 打包成一个 Request 对象
             req = Request(rid=self.next_rid, prompt=prompt, state=state,
                           tokens=toks, logits=o.logits)
-            self.next_rid += 1
+            self.next_rid += 1              # 每次admit拉一个请求 请求编号就+1
             self.running.append(req)
             self.waiting.pop(0)
             self.n_fwd += 1
 
 
-
+    # 专门做 decode
     def decode_step(self):
-        """running 里所有请求各推 1 个 token —— M5 的核心就这一句"""
+        """把 running 里每个请求的“最后一个 token”拼成 [B, 1]，一次 forward 算 B 个请求，
+            每个请求各得 1 个新 token，追加到 tokens；够 20 个的挪进 finished
+        """
 
         dev = next(self.model.parameters()).device
 
         # 拼 batch：每个请求的最后一个token [B,1]
+        # self.running = [req_0, req_1, ..., req_7]  8个请求各自最后一个 token
+        # r.tokens[-1] 是 Python int类型，torch.cat和model需要张量
+        # [[r.tokens[-1]] 内层是token_id，外层括号是batch —— [1,1] 沿着dim0 cat成 ——> [8,1]
         inp = torch.cat([torch.tensor([[r.tokens[-1]]], device=dev) for r in self.running], dim=0)
+        # 比如：inp = tensor([[257],[891],...,[1024]])   [8,1]
 
         # 每个请求的position都不一样，各自的state.n
+        # pos 形状 [8,1]
         pos = torch.tensor([[r.state.n] for r in self.running], device=dev)
 
         # 一次 forward 算 B 个请求
-        self.patcher.bind([r.state for r in self.running])
+        # 这里就传了一个state列表到 bind (8 个 PagedState 的 list)  ———— 每个请求一个
+        # bind里面在 第一次 或 B变大 的时候分配 tab_t 和 lens_t，patched用这计算attn
+        self.patcher.bind([r.state for r in self.running])     
         o = self.model(inp, past_key_values=None, use_cache=False,
                        position_ids=pos)
 
@@ -266,6 +289,7 @@ class Batcher:
 
         # 够 STEPS 的挪进 finished
         still = []
+        # 遍历 running 的每个 request，f.tokens够20个了就挪进 finished
         for f in self.running:
             if len(f.tokens) >= self.n_steps:
                 self.finished.append(f)
@@ -287,10 +311,11 @@ class Batcher:
                 self.decode_step()
         
         # 回收：每个finished请求的块还回 free
-        out = {}
+        # 构造返回字典 {rid : tokens}
+        out = {}            
         for r in self.finished:
-            out[r.rid] = r.tokens
-            self.alloc.free_blocks(r.state.table)
+            out[r.rid] = r.tokens                   # 取出 tokens
+            self.alloc.free_blocks(r.state.table)   # 还块
         self.finished = []      # 清空
         return out
 

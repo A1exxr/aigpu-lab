@@ -1,8 +1,8 @@
-"""R1：把自研 flash attention 注册成 PyTorch 算子。
+"""R1：把自研 flash attention 注册成 PyTorch 算子
 
 现状：`kernels/w5_flash_attn.py` 里 `flash_attn(q, k, v)` 只是一个 Python 函数，
       PyTorch 的 dispatcher 不认识它 —— 不能进 torch.compile 的图，profiler 里没有名字，
-      也没法挂 autograd。
+      也没法挂 autograd
 
 目标（四条判据，跑 `python engines/fa_op.py` 全绿才算过）：
   ① torch.ops.aigpu.flash_attn(q, k, v, scale) 与 SDPA 数值一致（fp16，max diff < 2e-3）
@@ -10,7 +10,6 @@
   ③ torch.profiler 里能看到 `aigpu::flash_attn` 这个名字
   ④ 反向能跑：dq/dk/dv 与 PyTorch 自动求导的 rel err < 2e-2
 
-三条 TODO（每处都有详细提示，按顺序填）。
 """
 import sys
 from pathlib import Path

@@ -42,7 +42,7 @@ def _attn_bwd_kernel(Q, K, V, DO, LSE, DQ, DK, DV,
     # tl.dot收到fp32输入时，默认不走真fp32，而是把位数从23位砍到10位(tf32)，这样就过不了1e-5 的误差判断
     s = tl.dot(q, tl.trans(k), input_precision="ieee") * scale
 
-    p = tl.exp(s - lse[:,None])      
+    p = tl.exp(s - lse[:,None])      # lse沿着行方向广播 成 [S,1]
 
     # dv = p.transpose(-1, -2) @ do    不能用torch的方法
     dv = tl.dot(tl.trans(p), do, input_precision="ieee")

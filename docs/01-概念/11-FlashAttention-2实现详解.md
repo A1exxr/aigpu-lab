@@ -84,7 +84,7 @@ grid = (n_kv_blocks, B*H)              grid = (n_q_blocks, B*H)
 |---|---|---|
 | `S = Q K^T` | `2 · Br · Bc · D` | matmul（Tensor Core） |
 | `O += P V` | `2 · Br · Bc · D` | matmul（Tensor Core） |
-| `exp(S - m)` | `Br · Bc` 次 exp ≈ `4 · Br · Bc` FLOPs | **非 matmul**（SFU） |
+| `exp(S - m)` | `Br · Bc` 次 exp；按吞吐折算约 8 个 FMA/次 → `8 · Br · Bc` FMA 槽位 | **非 matmul**（SFU，`MUFU.EX2`） |
 | 行 max / 行 sum | `2 · Br · Bc` | 非 matmul |
 | `O *= alpha` | `Br · D` | 非 matmul |
 | `l = l·alpha + rowsum` | `Br` | 非 matmul |
@@ -99,6 +99,8 @@ D=128, Bc=64 → 6/512 + 1/256 = 1.17% + 0.39% ≈ 1.6%
 ```
 
 **所以论文第 1 条改动最多省 1–2% 的时间**（再算上 SFU 和 Tensor Core 并行、exp 可以藏在 matmul 后面，实际更低）。
+
+> **口径修正（2026-11-13）**：`exp` **不是 4 个 FLOPs**，它是 SFU 指令 `MUFU.EX2`。Ada 上每 SM **16 lane/clk**，而 FFMA 是 **128/clk** ⇒ 一次 exp 约占 **8 个 FMA 的发射槽**；相对 Tensor Core（4060 fp16 约 512 FMA/clk/SM）约 **1/32**（不是 1/4）。所以上面那个 1.6% 是 **FLOPs 口径**，**时间占比会更高（约 3–5%）**——SFU 与 TC 的并行度不同，这部分不一定藏得住。用 `exp2` 代替 `exp` 正是为了省掉那次 `× log2(e)`。
 
 那为什么还要做？因为**免费**：
 
@@ -214,13 +216,16 @@ def _fa2_fwd(Q, K, V, O, L, M,       # L=lse, M 可省（只调试用）
 
 | 配置 | Br / Bc | 线程 | acc 寄存器/线程 | S 寄存器/线程 | smem/级 | 3 级 smem |
 |---|---|---|---|---|---|---|
-| A | 64 / 64 | 128（4 warp） | `64×128×4 / 128 = 32` | `64×64×4/128 = 16` | K 16 KB + V 16 KB = 32 KB | 96 KB ❌ 超 100 KB 上限 |
-| B | 64 / 32 | 128（4 warp） | 32 | 8 | K 8 + V 8 = 16 KB | 48 KB ✅ |
-| C | 128 / 64 | 256（8 warp） | `128×128×4/256 = 32` | `128×64×4/256 = 16` | 32 KB | 64 KB（2 级）✅ |
+| A | 64 / 64 | 128（4 warp） | `64×128 / 128 = 64` | `64×64 / 128 = 32` | K 16 KB + V 16 KB = 32 KB | 96 KB ⚠️ 只剩约 3 KB，放不下临时缓冲 |
+| B | 64 / 32 | 128（4 warp） | `64×128 / 128 = 64` | `64×32 / 128 = 16` | K 8 + V 8 = 16 KB | 48 KB ✅ |
+| C | 128 / 64 | 256（8 warp） | `128×128 / 256 = 64` | `128×64 / 256 = 32` | 32 KB | 64 KB（2 级）✅ |
+
+> 口径（2026-11-13 修正）：**每线程元素数 = 块内元素总数 ÷ 线程数**——acc 的块内总数是 `Br×D`，S 是 `Br×Bc`，**不要再除 warp 数**（warp 数已经算在「线程数」里了）。三组配置的 acc 恰好都是 64，因为 `Br×D ÷ 线程数` 在 A/B/C 里都等于 64；S 分别是 32 / 16 / 32。
+> 上一版这三个格子都写成了正确值的一半（且 `64×128×4 / 128 = 32` 这个算式本身算出来是 256），是照印象填的、没代回公式验算。
 
 4060 单 SM：**寄存器 64K**（每线程上限 255）、**smem 100 KB**（opt-in）。取 B 或 C：
 
-- **B（Br=64, Bc=32, 128 线程）**：每 block 寄存器约 `128 × (32+16+32 杂项) ≈ 10K` → 可驻留 2–4 个 block，占用率好；缺点是 `Bc=32` 使 `exp` 的标量开销占比上升（1.6% → 2.3%）。
+- **B（Br=64, Bc=32, 128 线程）**：每 block 寄存器约 `128 × (64+16+32 杂项) ≈ 14K` → `64K / 14K ≈ 4` 个 block，占用率好；缺点是 `Bc=32` 使 `exp` 的标量开销占比上升（1.6% → 2.3%）。
 - **C（Br=128, Bc=64, 256 线程）**：Tensor Core 效率更高（`m16n8k16` 切得更满），但 1 个 block/SM 时只有 8 warp，延迟隐藏要靠 ILP。
 
 **建议：先写 B（好调试、占用率高），跑通后改 C 比数字。** 这和当初 GEMM 从 32×32 到 64×64 的顺序一样。
@@ -268,7 +273,7 @@ off_hkv = off_h // (H // HKV)     # 前向：q head → kv head
 2. 反向里 dK/dV 的累加目标（**4 个 q head 会往同一个 kv head 累加 → 要么 atomic，要么在 dkdv kernel 里对 4 个 q head 求和**）
 3. K/V 的 cache 形状（`[B, HKV, S, D]`，不是 `[B, H, S, D]`）
 
-**GQA 反向是 v2 实现里最容易错的地方**：dK/dV 的累加维度从「1 个 head」变成「group 个 head」，如果你按 `[B,H,...]` 分配 dK，会多分配 4 倍并且 3/4 是垃圾。
+**GQA 反向是 v2 实现里最容易错的地方**：dK/dV 的**累加维度**从「1 个 head」变成「group 个 head」。正确写法是 **grid 用 HKV**（一个 block 负责一个 KV head）、内层循环扫这一组的 group 个 q head —— 累加在寄存器里**自然发生，不需要额外写求和代码**。错法是 grid 用 H、按 `[B,H,...]` 分配 dK：多分配 4 倍、3/4 是垃圾，或者被迫用 `atomicAdd`。
 
 ---
 
@@ -367,7 +372,7 @@ dq    = ds   @ K * scale
 2. **为什么 Q 外层更好**：「FA1 每个 KV 块都要把 O 读改写一遍 HBM，S=2048、D=128、H=32 时是 1 GiB 的 O 流量；FA2 只写一次，16 MiB。」
 3. **warp 怎么切**：「沿 Q 的行切，S/O/softmax 全 warp 私有，K/V 共享 smem，只有装 K/V 时需要 barrier。沿 D 切会逼出跨 warp 归约。」
 4. **causal 怎么省**：「外层循环上限改成对角块，块内再 mask；只做 mask 不做跳过，等于白算一半。」
-5. **GQA**：「`kv_head = q_head // group`，K/V cache 形状是 `[B, HKV, S, D]`；反向里 dK/dV 要跨 group 个 q head 累加，这是最容易错的地方。」
+5. **GQA**：「`kv_head = q_head // group`，K/V cache 形状是 `[B, HKV, S, D]`；反向里 dK/dV 按 KV head 累加 —— grid 用 HKV、内层扫 group 个 q head，累加就自然发生了，不用额外写求和；写成 grid=H 就会多算 4 倍或要 atomic。」
 6. **反向为什么两个 kernel**：「dkdv 和 dq 各切一个循环维度，各自没有写冲突，所以不用 atomic、结果逐位可复现；用 atomic 的版本每次跑都不一样。」
 
 ---

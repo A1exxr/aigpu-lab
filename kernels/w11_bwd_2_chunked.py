@@ -35,11 +35,24 @@ def _bwd_preprocess(O, DO, DELTA,
     b = pid_bh // H                         # B=1，b就是0
     h = pid_bh % H                          # 头的编号
     base = (b * H + h) * S * D              # 这个 (b,h) 头的起点
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)                #  全局行索引，本 program 负责的行段起点
+    
+    # tl.arange(0, BLOCK_M)就表示 一维张量 [0, 1, 2, ..., BLOCK_M - 1]
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)                # 全局行索引，本 program 负责的行段起点
     offs_d = tl.arange(0, D)                                        # D 维列索引，D 维没有分块
 
+    # offs_m 不是一个数，是一个张量[BLOCK_M,]，里面有 BLOCK_M 个行号，必须 [:, None] 竖起来才能和列偏移广播
     # offs_m[:, None] * D ———— 每行的起始偏移（行号 × D）
     # offs_d[None, :]   ———— 行内列偏移
+    '''
+        在triton里面 给 基址 + 整个块的偏移表，编译器切给线程
+        用向量广播一次性算出整个 (BLOCK_M, D) 块的每个地址，不是算一个指针
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)        # (BLOCK_M,) 整块的行号
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)        # (BLOCK_N,) 整块的列号
+        ptr = offs_m[:, None] * N + offs_n[None, :]             # (BLOCK_M, BLOCK_N) 整块的地址表
+        x = tl.load(A + ptr)                                    # 一次取整块
+    '''
+    
     ptr = base + offs_m[:, None] * D + offs_d[None, :]  
 
     o  = tl.load(O  + ptr)                       # (BLOCK_M,D)  (64, 64)
