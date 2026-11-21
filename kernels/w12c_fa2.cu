@@ -9,7 +9,7 @@
         寄存器内 online softmax（lane 内 4 个数 + 跨 4 条 lane 两次 shuffle）
         P 直接按 A 布局打包 → 16 条 mma 算 P·V → 收尾除 l
 
-    ---- 为什么 P 不用过 smem（FA2 最漂亮的一处）----
+    ---- 为什么 P 不用过 smem ----
       sc[nt] 的 C 布局： c0,c1 = P[g][2t], P[g][2t+1]      c2,c3 = P[g+8][...]
       mma 的 A 布局：    a0,a1 = P[g][2t], P[g][2t+1]      a2,a3 = P[g+8][...]
 
@@ -58,6 +58,7 @@ __device__ __forceinline__ float warp_max4(float v)
     // 每条 lane 只有这一行的 2 个分数（c0,c1）
     // 每条 lane 和 lane ^ 1 交换 v
     // 0↔1, 2↔3, 4↔5, ..., 30↔31
+    // xor 1 交换：两边都变成两者的 max
     v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
 
     // 每条 lane 和 lane ^ 2 交换
@@ -68,6 +69,7 @@ __device__ __forceinline__ float warp_max4(float v)
 }
 
 // 4 条 lane 的 sum 归约
+// 归约后的和，4 条 lane 都是同一个值
 __device__ __forceinline__ float warp_sum4(float v)
 {
     v += __shfl_xor_sync(0xffffffffu, v, 1);
@@ -75,7 +77,7 @@ __device__ __forceinline__ float warp_sum4(float v)
     return v;
 }
 
-// swizzle 重排
+// 128B swizzle 重排
 // 把索引 c 拆成：
             // 块号 b = c >> 3      （0..7，第几个 16 字节块）
             // 块内偏移 = c & 7     （0..7，块内第几个 half）
@@ -83,6 +85,7 @@ __device__ __forceinline__ float warp_sum4(float v)
 // 传入的 r 和 c 必须是相对于当前 smem tile 的局部坐标，且 c 的单位必须是 half（元素个数），绝不能是字节偏移
 __device__ __forceinline__ int swz(int r, int c) 
 {
+    // x << n  ≡  x * 2^n  ————> << 3 就是成 2的3次方
     return r * HEAD_DIM + ((((c >> 3) ^ (r & 7)) << 3) | (c & 7));          // c & 7 用 | 还是 + 都对
 }
 
@@ -109,6 +112,10 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
     const int lane    = tid & 31;
     const int g       = lane >> 2;              // 行号 0 ... 7
     const int tcol    = (lane & 3) * 2;         // 起始列 0 2 4 6
+
+    // 这里是 ldmatrix.x2 只需要 16 个地址，指令硬件在设计上就只从 lane 0-15 读取地址
+    // 只用 lane 0-15 给地址，是 .x2 的硬件规则，和 A/B 布局无关
+    // lane 0-7 给左半（偏移 0），lane 8-15 给右半（偏移 8），lane 16-31 夹回 0/8（硬件不看，但指针不能越界)
     const int gmask   = ((lane / 8) & 1) * 8;   // ldmatrix 的列组偏移
 
     // S >= TILE_M 时把块起点夹到 S-TILE_M，保证块内 64 行全部真实存在
@@ -123,12 +130,12 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
         Qs形状是[64][64]，每行 64个half = 128字节 = 32 words = 32 bank
         每行的起始地址都是128字节的倍数，所以每行都从 bank0 开始
         ldmatrix 是一个 warp 级指令，32 条 lane 都会参与，每个线程都要读 8个half = 16字节
-        硬件不会让 32条lane 在同一个 transaction 里同时发32个16字节请求，一个shared memory transaction最多处理128字节，所以在16字节粒度下分成4个phase
+        但硬件不会让 32条lane 在同一个 transaction 里同时发 32个16字节=512字节 的请求，一个shared memory transaction最多处理128字节，所以在16字节粒度下分成4个phase
         所以ldmatrix的8条lane(1个phase，刚好访问16*8=128字节)在加载数据的时候，8条lane各读一行，同一列c
         (128r+2c)/4%32 = (32r+1/2)%32 = (1/2c) % 32
         8条lane全落在同一个bank(c/2)  为 8-way conflict
 
-        通过 swizzle 把每行的 16字节快错开     一条lane的访问粒度就是8*2=16字节，16 字节也是是 ldmatrix 的最小访问单位
+        通过 swizzle 把每行的 16字节块错开     一条lane的访问粒度就是8*2=16字节，16 字节也是 ldmatrix 的最小访问单位
         swizzle 不改变数组大小，改变元素在smem的存放顺序
         HEAD_DIM = 64 half = 128 字节 = 8 个 16 字节块
         把索引 c 拆成：
@@ -152,6 +159,8 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
                     011  -> 十进制是 3
 
             块号 b 和 r&7 异或 ———— 把每行的 8 个块“循环移位”，每行错开的量不同
+            b ^ (r & 7) 能保证不重复，是因为 固定 b，b ^ x 对 x = 0..7 是 0..7 的一个排列
+            r & 7 不是随便写的，因为一行是8个块
 
         ldmatrix 每条 lane 要连续读 8 个 half（16 字节 = 1 个块），swizzle 只换 块的位置，不换 块内 8 个 half 的顺序
         swizzle 要保证的是：每一组 8 条 lane 的 8 个块号互不相同。因为每个 16 字节块占 4 个 bank，8 个不同块就覆盖 32 个 bank，于是这一组内 0 冲突
@@ -173,13 +182,16 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
 
     // ---- Q → 4 个 A 片段 ----
     // 忘记了就看stageA的注释
-    unsigned aq[HEAD_DIM / 16][4];              // 4个D维段，每段都有4个寄存器
+    unsigned aq[HEAD_DIM / 16][4];              // Q[16][64]   4个D维段，每段都有4个寄存器
     for (int kk = 0; kk < HEAD_DIM / 16; ++kk)  // 遍历4个D维段
     {
-        // 行 = lane % 16        → 0..15，覆盖 16 行
-        // 列组 = lane / 16      → 0 或 1，选左半（列 0..7）或右半（列 8..15）
-        const int row_swz_q = warp_id * WARP_M + (lane % 16);
-        const int col_swz_q = kk * 16 + (lane / 16) * 8;
+        // 行地址 = lane % 16   
+        // lane0-7 和 lane16-23 提供的行地址一样，但是K方向列段不一样 k+0...7 和 k+8...15
+        const int row_swz_q = warp_id * WARP_M + (lane % 16);       // 本warp的16行中的第几行 0 1 ... 15
+
+        // 列组 = lane / 16      0 或 1，选左半（列 0..7）或右半（列 8..15）
+        // ldmatrix.x4 要搬的 A 是16*16，被切成 4 个 8×8 块，所以D段内部也要分 左右8个
+        const int col_swz_q = kk * 16 + (lane / 16) * 8;            
         // const half* p = Qs + (size_t)(warp_id * WARP_M + (lane % 16)) * HEAD_DIM + kk * 16 + (lane / 16) * 8;        // 换swizzle方法读取smem
         const half* p = Qs + swz(row_swz_q, col_swz_q);
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -249,12 +261,18 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
                 sc[nt][c] = 0.f;
             }
         // 4 个 n-tile 段 x 4 个 K 段
+        // 这里算S[16][32] = Q[16][64] · Kᵀ[64][32]
+        // 先遍历 输出为 N
+        // 内部再遍历 归约维 K
         for (int nt = 0; nt < TILE_N / 8; ++nt)
         {
             for (int kk = 0; kk < HEAD_DIM / 16; ++kk)
             {
+                // B的布局，而且是.x2，只有 lane 0-15 读取地址；且 B 的 16×8 切成 2 个块：是 8 行 × 2 个 K 段
+                // 16 条 lane 覆盖的是“8 行 × 2 个块”
+                // 8*8只有8个物理行，所以是 lane % 8 确定在哪一行
                 const int row_swz_k = nt * 8 + (lane % 8);
-                const int col_szw_k = kk * 16 + gmask;
+                const int col_szw_k = kk * 16 + gmask;          // gmask 就加到 归约的维度上就行 这里就是K维
                 const half* p = Ks + swz(row_swz_k, col_szw_k);
                 // const half* p = Ks + (size_t)(nt * 8 + (lane % 8)) * HEAD_DIM + kk * 16 + gmask;        // 读ks要用swizzle读
                 unsigned b0, b1;
@@ -324,15 +342,17 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
                  c < 2（c0,c1）属于行 row0 = qrow + g，就是上面行0~7 
                  c >= 2（c2,c3）属于行 row1 = qrow + g + 8，上面行8~15
 
-                 3层求max，第一层就是lane内 c0 c1 比 mx0 (row0的局部)
+                3层求max，第一层就是lane内 c0 c1 比 mx0 (row0的局部)
                                             c2 c3 比 mx1(row1的局部)
-                    第二层是 nt 循环累积 4 个 n-tile，mx0 就覆盖 row0 的 8 个分数，mx1也是
+                    第二层是 nt 循环累积 4 个 n-tile(每个lane在每个n-tile里只拿两个key)，mx0 就覆盖 row0 的 8 个分数，mx1也是
                     第三层是 warp_max4 合并 4 条lane，mn0 就是 row0 的 32列完整的 max；mn1 是 row1 的完整 max
                     16 行之间不需要再比 max，因为 softmax 按行独立
                 
                 */
             }
         }
+        // 这时候第二层已经结束了，mx0 此时就是 4 个 n-tile 里 本lane负责的 8个分数(4 个 nt × 2 个 c0,c1)的最大值
+        // 4 条 lane 一比 = 这一行的全局 max，这一行是 当前 K/V tile 内的一行
         const float mn0 = warp_max4(mx0);
         const float mn1 = warp_max4(mx1);
 
@@ -349,9 +369,10 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
             }
         l0 = l0 * a0 + warp_sum4(s0);
         l1 = l1 * a1 + warp_sum4(s1);
+        // mn0 是“当前 tile 的 32 个 + 历史 m0”的 max，不是“整行 S 个的 max” ———— 整行的 max 要等所有 jt 循环结束，m0 累积完才是
         m0 = mn0; m1 = mn1;
 
-        // O 累加器按 alpha 缩放（寄存器里，32 次乘法就完事）
+        // O 累加器按 alpha 缩放（寄存器里，32 次乘法）
         for (int nd = 0; nd < HEAD_DIM / 8; ++nd)
         {
             // c0,c1 属于上半块行 乘 a0
@@ -364,13 +385,44 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
         // P 是 C 布局，C布局=A布局，c0,c1 对应 a0,a1    c2,c3 对应 a2,a3
         // 所以 P 的两个 C 布局 n-tile（sc[0]、sc[1]）可以直接打包成 A 的两个寄存器
 
-        // P 的 K 是 TILE_N = 32，mma 的 K=16，所以拆 2 段
+        // sc最后装的是softmax之后的p分数，但是也不能直接算，因为p的类型是fp32，mma 的 A操作数要 fp16 
+        // pact2 做两件事：fp32 → fp16 转换； 两个 fp16 打包成 1 个 32 位寄存器
+        // m16n8k16 的 A 和 C，用的是同一套“2×2 块”lane 映射
+        // A 的 a0,a1（行 g，列 2t, 2t+1）和 C 的 c0,c1（行 g，列 2t, 2t+1）是同一个位置
+        // A 的 a2,a3（行 g+8，列 2t, 2t+1）和 C 的 c2,c3（行 g+8，列 2t, 2t+1）是同一个位置
+
+        // P 的 K维 是 TILE_N = 32，mma 的 K=16，所以拆 2 段
         // 把 sc 里 4 个 n-tile（每个 8 个 key）两两拼成 ks 的 16 个 key
         unsigned pA[2][4];
         for (int ks = 0; ks < 2; ++ks)
         {
-            // ks = 0：P 的 key 0..15，用 sc[0]（key 0..7）和 sc[1]（key 8..15）
-            // ks = 1：P 的 key 16..31，用 sc[2] 和 sc[3]
+            /*
+                A布局：4个寄存器装8个half
+                    a0,a1 = A[g][2t],   A[g][2t+1]        ← 行 g，前 8 列
+                    a2,a3 = A[g+8][2t], A[g+8][2t+1]      ← 行 g+8，前 8 列
+                    a4,a5 = A[g][2t+8], A[g][2t+9]        ← 行 g，后 8 列
+                    a6,a7 = A[g+8][2t+8], A[g+8][2t+9]    ← 行 g+8，后 8 列
+                
+                C布局：sc[nt][c]；
+                nt（0..3）：第几个 n-tile。一个 n-tile = 8 个 key，4 个 n-tile 覆盖 32 个 key；
+                c（0..3）：C 布局的 4 个 float，对应 mma 输出的 4 个位置
+                    c	            行	        列（key）
+                    c = 0	    g（上半块）	    nt*8 + 2t               nt*8是n-tile的全局列偏移
+                    c = 1	    g（上半块）	    nt*8 + 2t + 1
+                    c = 2	    g+8（下半块）	nt*8 + 2t
+                    c = 3	    g+8（下半块）	nt*8 + 2t + 1
+
+                    sc[nt][0] = C[g][nt*8 + 2t]
+                    sc[nt][1] = C[g][nt*8 + 2t+1]
+                    sc[nt][2] = C[g+8][nt*8 + 2t]
+                    sc[nt][3] = C[g+8][nt*8 + 2t+1]
+
+
+                A 布局（pA[ks][0..3] = a0..a7）
+                    pA[ks][0] 要 a0,a1 = A[g][2t], A[g][2t+1]——就是“行 g 的前 8 列”
+                    sc[2ks+0][0] 和 sc[2ks+0][1] 正好是 S[g][2t], S[g][2t+1]
+            
+            */
             pA[ks][0] = pack2(sc[2 * ks + 0][0], sc[2 * ks + 0][1]);
             pA[ks][1] = pack2(sc[2 * ks + 0][2], sc[2 * ks + 0][3]);
             pA[ks][2] = pack2(sc[2 * ks + 1][0], sc[2 * ks + 1][1]);
@@ -383,7 +435,10 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
             for (int nd = 0; nd < HEAD_DIM / 8; ++nd)
             {
                 /*
-                    V 是 [key][dim]；mma 要 B = Vᵀ 的 col 布局 → 用 .trans
+                    关于转置 .trans
+                    V 是 [key][dim]；mma 要 B 操作数要 V 的归约维(K维，这里就是key/token维度)在寄存器里连续
+                    用 .trans 从物理行读出数据后，在寄存器内转置，使 key 维变成连续的 Col-Major 布局，满足 MMA 要求
+
                     Vs 整个数组是连续存储的，D维连续，但 mma 要的同一 D 维的相邻 token这 8 个元素
                     V[t][g]      地址 = t*64 + g
                     V[t+1][g]    地址 = (t+1)*64 + g = t*64 + g + 64, 地址差64，不连续
@@ -398,10 +453,39 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
                         S = Q @ K^T，K形状是[token][dim] (K*N)，Ks是正常存储的，取地址的时候D维是连续的，所以mma.sync在读的时候连续的读8个half
                         但计算的时候 B操作数 要的是K^T[dim][token] 的dim维度连续，然后刚好存进去的Ks就是D维连续的，所以不用trans
 
+                        S = Q @ K^T，K形状是[token][dim]   这里B操作数在读的时候 K本来就dim连续，所以正常读，然后计算的时候算的是Q@K^T而不是Q@K，
+                        所以不用对K^T进行.trans，因为K^T的归约维，也就是dim维，本来就是连续的
+
                         O = P @ V，V形状是K*N，存进去的时候也是正常存，D维连续，但B操作数要的是V的第一维，也就是K维连续，但K维不连续，所以用了.trans
+
+
+                    关于偏移量
+                    偏移量 ((lane / 8) & 1) * 8
+                    偏移加在行还是列，不由 .trans 决定，而由  MMA 的 B布局的矩阵的 K 维在物理内存中对应哪个轴  决定  
+                    
+                    S = Q @ K^T
+                        MMA 中 B 的含义：K 的一个 tile [K=16, N=8]，K 维 = dim
+                        B 的 K=16 对应物理上的 dim 0..15（同一 token 的 16 个维度）
+                        B 的 N=8 对应物理上的  token 0..7（8 个不同的 key）
+                        物理内存 Ks[token][dim]：dim 是列
+                        ldmatrix.x2 把 16 行的数据分成两个 8×8 块交给硬件；这两个块必须覆盖 MMA 所需的 K=16 的全部范围
+                        要覆盖 dim 0..15 ——> 两个块必须在列方向上各占 8
+                        所以 lane 8-15 的地址要在列上加 8（gmask）
+
+
+                    O = P @ V
+                        MMA 中 B 的含义：V 的一个 tile [K=16, N=8]，K 维 = token
+                        B 的 K=16 对应物理上的 token 0..15（同一 dim 的 16 个时间步）
+                        B 的 N=8 对应物理上的  dim 0..7（8 个不同的维度）
+                        物理内存 Vs[token][dim]：token 是行
+                        要覆盖 token 0..15 → 两个块必须在行方向上各占 8
+                        所以 Lane 8-15 的地址要在行上加 8
+                    
+                    偏移量永远加在归约维（K 维）上
                 */
                 
-                const int vr = ks * 16 + (lane % 8) + ((lane / 8) & 1) * 8;
+                
+                const int vr = ks * 16 + (lane % 8) + ((lane / 8) & 1) * 8;         
                 const int col_swz__v = nd * 8;
                 const half* p = Vs + swz(vr, col_swz__v);
                 // const half* p = Vs + (size_t)vr * HEAD_DIM + nd * 8;
