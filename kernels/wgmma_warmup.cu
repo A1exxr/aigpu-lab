@@ -113,7 +113,7 @@ __device__ __forceinline__ unsigned long long make_desc(const void* p,
     return d;
 }
 
-// 确保此指令之前所有smem写入对后续wgmma可见
+// 保证 fence 之前的 WGMMA 指令执行完毕后，才发射 fence 之后的 WGMMA 指令
 __device__ __forceinline__ void wgmma_fence() {
     // .aligned：warpgroup内 128 线程都到达才继续
     asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");

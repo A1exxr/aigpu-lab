@@ -27,3 +27,8 @@ echo
 echo "=== 3) w12f（K/V 也走 TMA）"
 python kernels/w12f_fa2_tma.py
 echo "期望：与上面三档位级一致"
+
+echo
+echo "=== 4) w12g（warp specialization：producer 只发 TMA / consumer 只算）"
+python kernels/w12g_fa2_ws.py
+echo "期望：与上面三档位级一致"

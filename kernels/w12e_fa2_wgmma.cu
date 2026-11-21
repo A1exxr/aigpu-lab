@@ -10,7 +10,7 @@
 
 
     与 w12d_fa2_tile128.cu 的三处结构差别：
-      1. Q/K 的 smem 布局从 XOR swizzle 改为 core-matrix 顺序（wgmma）
+      1. Q/K 的 smem 布局从 XOR swizzle 改为 core-matrix 顺序，通过wgmma计算，但是没有用TMA，没有描述符
          V 仍用 swizzle 布局（PV 还是 mma.sync + ldmatrix）
       2. QK 从 4×mma.sync.m16n8k16 换成 4×wgmma.m64n32k16，
          线程划分从 1 warp = 16 行 ————> 变成  1 warpgroup = 64 行 
@@ -93,9 +93,10 @@ __device__ __forceinline__ unsigned long long make_desc(const void* p, unsigned 
     return d;
 }
 
+// wgmma_fence() 作为一个内存栅栏，强制保证在它之前的所有 SMEM 写入操作，对后续的异步 Tensor Core 操作是完全可见的
 __device__ __forceinline__ void wgmma_fence()
 {
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
 __device__ __forceinline__ void wgmma_commit()
 {

@@ -207,6 +207,7 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
         // 因为 cp.async 是 per-thread 的，每条线程的 wait_group 只保证“自己发射的 cp.async 完成”，要全 block 的 K/V 都到齐，必须 __syncthreads()
         __syncthreads();
         // 先 wait_group（等自己发射的搬完），再 __syncthreads()（等别人的搬完）
+        // 注：mbar_wait就不需要__syncthreads()，因为所有线程 mbar_wait 同一条 barrier(w12f文件)
         
         // 不能是 wait_group 0：等所有 group 完成；  那下一个 tile 的搬也被等，没有重叠——搬和算串行
         // 双缓冲的核心就是 wait_group 1——留一个 group 在飞，实现重叠

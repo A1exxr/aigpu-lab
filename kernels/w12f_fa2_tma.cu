@@ -5,9 +5,20 @@
         3、wgmma 是 Hopper 的 warpgroup 级、异步指令，w12e 的 QK 用的是这个
 
 
-    Q 矩阵没有使用 TMA 或 cp.async，而是由 256 个线程通过普通的同步 store 指令手动拷贝并重排进 SMEM 的
+    
     S = Q @ K^T  通过 wgmma 算，数据通过 TMA 搬运 + 双缓冲  ———— Q、K的描述符各自独立，一个 core-matrix 一个 swizzle 是合法的
     O = P @ V  还是 mma.sync 算
+
+    wgmma的矩阵描述符不是 必须 core-matrix，而是 描述符必须和物理布局对上
+    Q 矩阵没有使用 TMA 或 cp.async，而是由 256 个线程通过普通的同步 store 指令手动拷贝并重排进 SMEM 的
+    Q的描述符是 core-matrix，K是 swizzle 
+
+    硬件只认两组布局词汇，描述符的 swizzle 位就是选词：
+
+    swizzle	        硬件假设的物理布局	                                                    谁产的出来
+    0	            每个 8×8 块 = 连续 128 B（8 行压在一起），块间靠 LBO/SBO 跳	        线程、cp.async（能算任意地址）
+    1 / 2 / 3	    行主序，行宽 128 / 64 / 32 B，行内 16 B 块按行号异或	            TMA（直出）、线程、cp.async
+
 
 */
 
@@ -39,7 +50,7 @@ __device__ __forceinline__ unsigned pack2(float a, float b)
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
-// 4 条 lane 一起做行内归约（这 4 条 lane 共享同一行）
+
 __device__ __forceinline__ float warp_max4(float v)
 {
     v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
@@ -72,9 +83,6 @@ __device__ __forceinline__ int cm(int r, int c)
 __device__ __forceinline__ unsigned long long make_desc(const void* p, unsigned lbo,
                                                         unsigned sbo, unsigned swz_mode = 0)
 {
-    // __cvta_generic_to_shared 返回的是 size_t(64位)
-    // 描述符本身就是 64位 的，所以这里就需要 64位
-    // 而之前的cp.async的地址需要32位操作数，所以要截断
     const unsigned long long addr = (unsigned long long)__cvta_generic_to_shared(p);
     unsigned long long d = (addr >> 4) & 0x3FFFu;
     d |= ((unsigned long long)(lbo >> 4) & 0x3FFFu) << 16;
@@ -85,7 +93,7 @@ __device__ __forceinline__ unsigned long long make_desc(const void* p, unsigned 
 
 __device__ __forceinline__ void wgmma_fence()
 {
-    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 }
 __device__ __forceinline__ void wgmma_commit()
 {
@@ -110,7 +118,7 @@ __device__ __forceinline__ void wgmma_m64n32k16(float (&sc)[TILE_N / 8][4],
         : "l"(a_desc), "l"(b_desc));
 }
 
-// cp.async：ok=false 时 zfill（越界的 key 读成 0，靠 mask 挡住）
+
 // 这三行都没用了，都用的 TMA，没有走 cp.async了
 __device__ __forceinline__ void cp16(half* dst, const half* src, bool ok)
 {
@@ -147,6 +155,18 @@ __device__ __forceinline__ void mbar_wait(uint64_t *bar, uint32_t phase)
     "}\n" ::"r"(a), "r"(phase));
 }
 
+/*
+    K/V 是 3维的 [B*Hkv][S][D]
+    所以 TMA 搬运也要是 3D 的
+    gpt2 的 KV 张量是 [B, Hkv, S, D]，展平后就是三层：
+        维度 2（最外）：bh = b*Hkv + kvh  ————> 一共 B*Hkv 个"头"
+        维度 1（中间）：token 位置 0..S-1
+        维度 0（最内）：head_dim 0..63（每个 128 B = 64 个 half）
+    
+    block 要读的是 其中一个头的一段token，也就是这个 3D 张量的一个 {64, 32, 1} 小方块
+        box = {D=64, TILE_N=32, 1}
+        坐标 = (0, jt*TILE_N, bh)， 内层在前，正好对应 tma_load_3d(Kbuf, bar, map, 0, jt*TILE_N, bh)
+*/
 // 3D TMA：把 box [HEAD_DIM, TILE_N, 1] 搬到 smem，坐标 (x=D, y=token, z=bh)
 __device__ __forceinline__ void tma_load_3d(void *dst, uint64_t *bar,
                                             const CUtensorMap *tmap,
@@ -177,18 +197,18 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_wgmma_kernel(const __grid_cons
     __shared__ alignas(128) half Kbuf[2][TILE_N * HEAD_DIM];    // 2 × 4 KB，128B swizzle（TMA 直出）
     __shared__ alignas(128) half Vbuf[2][TILE_N * HEAD_DIM];    // 2 × 4 KB，swizzle
 
-    __shared__ alignas(8) uint64_t vbar[2];
+    __shared__ alignas(8) uint64_t vbar[2];         // K/V TMA时 共用的mbar
 
     const int bx = blockIdx.x;
     const int bh = blockIdx.y;
     const int b = bh / H;
     const int h = bh % H;
     const int kvh = h / (H / Hkv);
+    const int kv_bh = b * Hkv + kvh;        // 描述符第三维的下标
 
     const int row_base = max(0, min(bx * TILE_M, S - TILE_M));
 
     const size_t q_base = ((size_t)b * H + h) * S * HEAD_DIM;
-    const size_t kv_base = ((size_t)b * Hkv + kvh) * S * HEAD_DIM;
 
     const int tid = threadIdx.x;
     const int lane = tid % 32;
@@ -201,7 +221,7 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_wgmma_kernel(const __grid_cons
     const int row0 = wg * WWG + wi * WARP_M + (lane / 4);           //  lane / 4	0..7	warp 内第几行（4 条 lane 一组管一行）
     const int row1 = row0 + 8;                                      // 同一个lane   +8 行
 
-    // 初始化 V 的两个 mbarrier
+    // 初始化两个 mbarrier
     if(tid == 0)
     {
         mbar_init(&vbar[0], 1);
@@ -225,13 +245,12 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_wgmma_kernel(const __grid_cons
         if (tid == 0)
         {
             mbar_arrive_expect_tx(&vbar[buf], 2 * TILE_N * HEAD_DIM * (uint32_t)sizeof(half));
-            tma_load_3d(Kbuf[buf], &vbar[buf], &kmap, 0, jtile * TILE_N, bh);
-            tma_load_3d(Vbuf[buf], &vbar[buf], &vmap, 0, jtile * TILE_N, bh);
+            tma_load_3d(Kbuf[buf], &vbar[buf], &kmap, 0, jtile * TILE_N, kv_bh);    // 这里要传的是 kv_bh 不是 bh
+            tma_load_3d(Vbuf[buf], &vbar[buf], &vmap, 0, jtile * TILE_N, kv_bh);
         }
-
     };
 
-    // ---- online softmax 状态 ----
+    // ---- online softmax 状态，还是在寄存器里 ----
     const float qk_scale = scale;
     float m0 = NEG_INF, m1 = NEG_INF;
     float l0 = 0.f, l1 = 0.f;
@@ -249,9 +268,9 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_wgmma_kernel(const __grid_cons
     for (int jt = 0; jt <= jt_end; ++jt)
     {
         if (jt + 1 <= jt_end)
-            load_kv(jt + 1, buf ^ 1);
-        mbar_wait(&vbar[buf], (jt >> 1) & 1);
-        __syncthreads();   // Kbuf[buf] 到齐
+            load_kv(jt + 1, buf ^ 1);               // 先把下一个 tile 发出去
+        mbar_wait(&vbar[buf], (jt >> 1) & 1);       // 等数据搬完；该指令是每个线程各自执行的；整条 barrier 的字节全到齐，不需要再__syncthreads()       
+
 
         if (jt <= jt_end_wg)
         {
@@ -266,17 +285,17 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_wgmma_kernel(const __grid_cons
             half* qwg = Qs + wg * (WWG * HEAD_DIM);   // 本 warpgroup 的 64 行
             half* kt = Kbuf[buf];
 
-            wgmma_fence();                            // smem 已就绪
+            wgmma_fence();                            // 保证 smem 已就绪
             for (int kk = 0; kk < HEAD_DIM / 16; ++kk)
             {
                 const unsigned long long ad = make_desc(qwg + kk * 128, a_lbo, a_sbo, 0);
-                // K 的 128B swizzle 布局里，第 kk 个 16-k 段是「行内第 kk 个 32 B」，不是 128 B 的整数倍
+                // K 的 128B swizzle 布局里，第 kk 个 16-k 段是 行内第 kk 个 32 B，不是 128 B 的整数倍
                 // 这里 K 的描述符 swizzle = 1，描述符里的 swizzle 位必须和 smem 里的物理布局一致
                 const unsigned long long bd = make_desc(kt + kk * 16, b_lbo, b_sbo, 1);
-                wgmma_m64n32k16(sc, ad, bd);            // 这里是用的 wgmma
+                wgmma_m64n32k16(sc, ad, bd);            // wgmma
             }
             wgmma_commit();
-            wgmma_wait0();
+            wgmma_wait0();          // 阻塞等待所有组完成
 
 
             const int gr0 = row_base + row0;
@@ -339,7 +358,7 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_wgmma_kernel(const __grid_cons
                 for (int nd = 0; nd < HEAD_DIM / 8; ++nd)
                 {
                     const int vr = ks * 16 + (lane % 8) + ((lane / 8) & 1) * 8;
-                    const half* p = Vbuf[buf] + swz(vr, nd * 8);
+                    const half* p = Vbuf[buf] + swz(vr, nd * 8);       // V 的 swizzle 布局是 TMA 按描述符写出来的
                     unsigned b0, b1;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
                                  : "=r"(b0), "=r"(b1)
@@ -381,23 +400,23 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_wgmma_kernel(const __grid_cons
 // host
 // ---------------------------------------------------------------------------
 
-// 构建 TMA 描述符，要 3D 的
+// 构建 3D TMA 描述符
 static int make_tensor_map(CUtensorMap *tmap, void *ptr, int BH, int S, int D)
 {
-    // 这里是构建V的描述符 V[TILE_N, HEAD_DIM]
+    // K/V 形状 [B*Hkv][S][D]
     // 在TMA里面x是连续维，y是跳跃维
-    cuuint64_t gdim[3]    = {(cuuint64_t)D, (cuuint64_t)S, (cuuint64_t)BH};
-    cuuint64_t gstride[2] = {(cuuint64_t)D * sizeof(half),                 // 行跨度 = 128 B
-                             (cuuint64_t)D * sizeof(half) * S};            // head 跨度
-    cuuint32_t box[3]     = {(cuuint32_t)D, (cuuint32_t)TILE_N, 1};
-    cuuint32_t estride[3] = {1, 1, 1};
+    cuuint64_t gdim[3]    = {(cuuint64_t)D, (cuuint64_t)S, (cuuint64_t)BH};     // 每个维度的元素个数
+    cuuint64_t gstride[2] = {(cuuint64_t)D * sizeof(half),                      // 行跨度 = 128 B
+                             (cuuint64_t)D * sizeof(half) * S};                 // head 跨度
+    cuuint32_t box[3]     = {(cuuint32_t)D, (cuuint32_t)TILE_N, 1};             // 每次搬多少个元素
+    cuuint32_t estride[3] = {1, 1, 1};  
 
     CUresult r = cuTensorMapEncodeTiled(
         tmap, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, 
         ptr, gdim, gstride,
         box, estride, 
         CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B,                    // smem 里读V用的是128B swizzle
+        CU_TENSOR_MAP_SWIZZLE_128B,                    // smem 里读K/V用的是128B swizzle
         CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
     if(r != CUDA_SUCCESS)
