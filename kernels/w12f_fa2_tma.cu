@@ -30,7 +30,7 @@
 #include <cstdio>
 
 
-#define TILE_M 128              // 一个 block 处理多少行 Q
+#define TILE_M 128              // 一个block负责的Q，一个block 里有 8个warp
 #define TILE_N 32               // 一次处理多少个 key
 #define HEAD_DIM 64
 #define SM_THREADS 256          // = 2 个 warpgroup
@@ -42,7 +42,7 @@
 // ---------------------------------------------------------------------------
 // 基础工具
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ float h2f(half h) { return __half2float(h); }
+__device__ __forceinline__ float h2f(half h) { return __half2float(h);}
 
 __device__ __forceinline__ unsigned pack2(float a, float b)
 {
@@ -289,13 +289,16 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_wgmma_kernel(const __grid_cons
             for (int kk = 0; kk < HEAD_DIM / 16; ++kk)
             {
                 const unsigned long long ad = make_desc(qwg + kk * 128, a_lbo, a_sbo, 0);
+
+                
                 // K 的 128B swizzle 布局里，第 kk 个 16-k 段是 行内第 kk 个 32 B，不是 128 B 的整数倍
+                // kk*16 是 swizzle 行主序布局的 k 步长 
                 // 这里 K 的描述符 swizzle = 1，描述符里的 swizzle 位必须和 smem 里的物理布局一致
                 const unsigned long long bd = make_desc(kt + kk * 16, b_lbo, b_sbo, 1);
                 wgmma_m64n32k16(sc, ad, bd);            // wgmma
             }
             wgmma_commit();
-            wgmma_wait0();          // 阻塞等待所有组完成
+            wgmma_wait0();          // 阻塞等待所有组完成       wait0 只管 wgmma，TMA 是另一套机制
 
 
             const int gr0 = row_base + row0;

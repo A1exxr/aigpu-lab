@@ -73,6 +73,16 @@
         再改 lbo 和 sbo
 
 
+
+
+    在 Hopper 架构的 WGMMA 指令集中，针对 FP16（及 BF16）数据类型，其 K 维度只有 1 种固定值，即 K = 16
+    WGMMA 的 FP16 形状被严格约束为 m64nNk16 的形式，具体的维度规则如下：
+                M 维度：固定为 64
+                K 维度：固定为 16
+                N 维度：可变，必须是 8 的倍数，取值范围从 8 到 256（如 m64n8k16, m64n64k16, 直到 m64n256k16）
+
+
+
     smem 描述符（64 位）：起始地址(>>4) + LBO(>>4) + SBO(>>4) + swizzle 模式
     布局：A 是 M 行 K 列、K 连续；B 是 K 行 N 列、N 连续（SS 变体都从 smem 读）
     顺序：wgmma.fence → mma_async → commit_group → wait_group → 才能读结果
@@ -125,6 +135,7 @@ __device__ __forceinline__ void wgmma_commit() {
 }
 
 // 阻塞当前线程，直到队列中所有已提交的异步组执行完毕（pending groups = 0）
+// 只等 wgmma 的命令
 __device__ __forceinline__ void wgmma_wait0() {
     asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
 }

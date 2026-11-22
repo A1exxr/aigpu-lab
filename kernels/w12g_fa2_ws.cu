@@ -1,21 +1,26 @@
-// ===========================================================================
-//  w12g_fa2_ws.cu —— FA3 风格的第一版：producer / consumer warp specialization 线程束特化
-//  
+/*
+    w12g_fa2_ws.cu —— FA3 风格的第一版：producer / consumer warp specialization 线程束特化
+    
+    和 w12f 的差别只有 谁干什么：
+    
+      w12f: 256 线程，8 个 warp 全都既搬（TMA）又算（wgmma + softmax + PV）
+      w12g: 384 线程 = 3 个 warpgroup
+            wg0 = producer：只发 TMA、只等 empty；寄存器 40
+            wg1/wg2 = consumer：只等 full、只算；寄存器 232
+    同步全靠 mbarrier 对：full[buf]（TMA 到齐，tx 计数） / empty[buf]（8 个 warp 都用完）
+    TMA 和 WGMMA 都是异步硬件单元，将 384 个线程（12 个 Warp / 3 个 Warpgroup）严格划分为 Producer（生产者） 和 Consumer（消费者） 两种角色，通过硬件级同步原语，实现数据搬运与矩阵计算的完美重叠
 
-//  和 w12f 的差别只有「谁干什么」：
-//  
-//    w12f: 256 线程，8 个 warp 全都既搬（TMA）又算（wgmma + softmax + PV）
-//    w12g: 384 线程 = 3 个 warpgroup
-//          wg0 = producer：只发 TMA、只等 empty；寄存器 40
-//          wg1/wg2 = consumer：只等 full、只算；寄存器 232
-//  同步全靠 mbarrier 对：full[buf]（TMA 到齐，tx 计数） / empty[buf]（8 个 warp 都用完）
-//
-//  判据（本地只需编译 + SASS）：
-//    SASS 里必须有 SETMAXNREG（DEC 1 次 INC 1 次）、UTMALDG.3D 2、HGMMA 4、
-//    LDGSTS = 0；上机后三档 max|diff| 必须与 w12f 位级一致。
+    S = Q @ K^T 和 O = P @ V 都通过 wgmma 进行计算
 
-// TMA 和 WGMMA 都是异步硬件单元，将 384 个线程（12 个 Warp / 3 个 Warpgroup）严格划分为 Producer（生产者） 和 Consumer（消费者） 两种角色，通过硬件级同步原语，实现数据搬运与矩阵计算的完美重叠
-// ===========================================================================
+    PV 的 A 操作数（P）不再经过 mma.sync 的 warp 级计算，而是直接作为 wgmma RS 变体的寄存器输入；
+    B（V）从 smem 描述符读；输出累加到 acc[8][4]——布局和 mma.sync 的 C 完全一致，所以 acc、l、写回都不用改
+
+
+    判据（本地只需编译 + SASS）：
+      SASS 里必须有 SETMAXNREG（DEC 1 次 INC 1 次）、UTMALDG.3D 2、HGMMA 4、
+      LDGSTS = 0；上机后三档 max|diff| 必须与 w12f 位级一致
+*/
+
 
 
 
@@ -33,7 +38,8 @@
 #define WARP_M 16               // PV 阶段：一个 warp 16 行
 #define WWG 64                  // QK 阶段：一个 warpgroup 64 行
 #define KV_CHUNK 8              // 16 B = 8 half
-#define CONS_WARPS (SM_THREADS / 32 - 4)
+#define PROD_WARPS 4            // producer 的 warp 数  4 
+#define CONS_WARPS (SM_THREADS / 32 - PROD_WARPS)       // consumer 的 warp 数  8
 #define NEG_INF (-1e30f)
 
 // ===== mbarrier.arrive（只到、不等）与 setmaxnreg =====
@@ -142,7 +148,9 @@ __device__ __forceinline__ void wgmma_m64n32k16(float (&sc)[TILE_N / 8][4],
 
 
 // RS 形式：A 来自寄存器（每线程 4 个 32 位寄存器 = 8 个 half），B 来自 smem 描述符
-// d 的 32 个 float 与 acc[8][4] 是同一套行列映射：d[4*nd+c] == acc[nd][c]
+// 参数 d 的 32 个 float 与 acc[8][4] 是同一套行列映射：一维展开的 d[4*nd+c] == 二维的 acc[nd][c]
+// float (&d)[8][4] 累加器
+// const unsigned (&a)[4]  A 操作数(引用一个长度为 4 的 unsigned 数组)
 __device__ __forceinline__ void wgmma_m64n64k16_rs(float (&d)[HEAD_DIM / 8][4],
                                                    const unsigned (&a)[4],
                                                    unsigned long long b_desc)
@@ -275,8 +283,13 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_ws_kernel(const __grid_constan
         for (int jt = 0; jt <= jt_end; ++jt)
         {
             const int buf = jt & 1;
-            if (jt >= 2)
+            if (jt >= 2)            // jt = 0,1 时，为双缓冲预热阶段，不需要等 empty
             {
+                /*
+                    producer 先等 empty，再发 TMA 翻 full；consumer 先等 full，再用完翻 empty
+                    jt=0,1 时 producer 不等 empty（buffer 初始空），直接发 TMA ———— full[0]、full[1] 翻了 phase 后，consumer 才能开始
+                    jt=2 时 producer 等 empty[0]，此时 consumer 已经用完 jt=0 的 buffer（empty[0] 已翻），producer 可以继续
+                */
                 const int empty_phase = ((jt - 2) >> 1) & 1;
                 mbar_wait(&empty[buf], empty_phase);
             }
@@ -293,6 +306,9 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_ws_kernel(const __grid_constan
                 tma_load_3d(Vbuf[buf], &full[buf], &vmap, 0, jt * TILE_N, kv_bh);
             }
         }
+
+        // 这里 return 就是提前退出 kernel 函数，producer的线程就不会继续走下去
+        // 不然下面还有wg_Reg_inc_consumer()等代码，producer的线程都会执行
         return;   // producer 到此为止
     }
 
@@ -396,8 +412,7 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_ws_kernel(const __grid_constan
             // ---- O += P·V：wgmma RS（A 来自寄存器 pA，B 走 V 的 swizzle 描述符）----
             for (int ks = 0; ks < 2; ++ks)
             {
-                const unsigned long long vd =
-                    make_desc(Vbuf[buf] + (size_t)ks * 16 * HEAD_DIM, 1, 1024, 1);
+                const unsigned long long vd = make_desc(Vbuf[buf] + (size_t)ks * 16 * HEAD_DIM, 1, 1024, 1);
                 wgmma_m64n64k16_rs(acc, pA[ks], vd);
             }
         }

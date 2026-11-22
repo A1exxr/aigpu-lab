@@ -7,7 +7,7 @@
 
 #include <cuda_fp16.h>
 
-#define TILE_M     128              // Q [128,64]
+#define TILE_M     128              // Q [128,64]       一个block负责的Q，一个block 里有 8个warp
 #define TILE_N     32               // K/V [32,64]
 #define HEAD_DIM   64
 #define SM_THREADS 256
@@ -72,7 +72,7 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
     const int lane    = tid & 31;
     const int g       = lane >> 2;              // 行号 0 ... 7
     const int tcol    = (lane & 3) * 2;         // 起始列 0 2 4 6
-    const int gmask   = ((lane / 8) & 1) * 8;   // ldmatrix 的列组偏移
+    const int gmask   = ((lane / 8) & 1) * 8;   // ldmatrix 的列组偏移    0 8 0 8 
 
 
     // 当 S < TILE_M 时，S - TILE_M 为负，max(0, ...) 将其截断到 0
@@ -95,8 +95,8 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
     unsigned aq[HEAD_DIM / 16][4];
     for (int kk = 0; kk < HEAD_DIM / 16; ++kk)
     {
-        // 行 = lane % 16        → 0..15，覆盖 16 行
-        // 列组 = lane / 16      → 0 或 1，选左半（列 0..7）或右半（列 8..15）
+        // 行 = lane % 16        0..15，覆盖 16 行
+        // 列组 = lane / 16      0 或 1，选左半（列 0..7）或右半（列 8..15）
         const int row_swz_q = warp_id * WARP_M + (lane % 16);
         const int col_swz_q = kk * 16 + (lane / 16) * 8;
         const half* p = Qs + swz(row_swz_q, col_swz_q);
@@ -118,7 +118,7 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
     const int row1  = qrow + g + 8;
     const int jt_end = min(row_base + TILE_M - 1, S - 1) / TILE_N;
 
-    // ---- cp.async 双缓冲：16B 一块，正好对应一个 swizzle 块 ----
+    // ---- cp.async 双缓冲：16B 一块，正好对应一个 swizzle 的粒度 ----
     // 将当前 tile 对应的 K/V 数据从 HBM 异步搬入 SMEM 双缓冲区中的指定 buffer
 
     /*
@@ -140,7 +140,7 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
                 buf ^= 1;
             总时间从 搬 + 算 降到 max(搬, 算)
 
-        Hopper（sm_90）上：用 TMA（cp.async.bulk.tensor） TMA 是 cp.async 的升级版——一条指令搬整个 tile，不需要 per-thread 循环，更省指令、更省寄存器
+        Hopper（sm_90）上：用 TMA（cp.async.bulk.tensor） TMA 是 cp.async 的升级版 ———— 一条指令搬整个 tile，不需要 per-thread 循环，更省指令、更省寄存器
     */
 
     /*
@@ -162,13 +162,21 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
             const int jj = c / (HEAD_DIM / 8);
             const int dd = (c - jj * (HEAD_DIM / 8)) * 8;   // 8 个 half = 16 B
             const int j  = jtile * TILE_N + jj;
+            /*
+                这里传的是 Chunk 的索引，但还是可以实现swizzle重排
+                因为 swz 的粒度就是 16 B，块内 8 个 half 的位置由 | (c & 7) 这一项原样保留下来了
+                    swz(r, dd + k) = r*128 + ( ((dd/8) ^ (r&7)) << 3 | k )
+                                    = r*128 + ( ((dd/8) ^ (r&7)) << 3 ) + k      // 因为 k < 8，| 等价于 +
+                                    = swz(r, dd) + k 
+                swz 是 chunk 基址的整体平移 + 块内偏移原样跟随，它把整个 8×16 B 的 chunk 当成一个不可分割的原子来搬
+            */ 
             half* ks = Kbuf[buf] + swz(jj, dd);
             half* vs = Vbuf[buf] + swz(jj, dd);
             if (j < S)
             {
                 const unsigned ka = (unsigned)__cvta_generic_to_shared(ks);
                 const unsigned va = (unsigned)__cvta_generic_to_shared(vs);
-                // cp.async.cg.shared.global：Ampere/Hopper 引入的异步拷贝指令，数据直接从 L2 Cache 到 SMEM，绕过寄存器文件
+                // cp.async.cg.shared.global：Ampere 引入的异步拷贝指令，数据直接从 L2 Cache 到 SMEM，绕过寄存器文件
                 // .cg：表示数据缓存在L2
                 // 16：固定搬运 16B (= 8 × half = 1 × uint4)
                 // 该指令是非阻塞的，发射后线程立即执行下一条指令，实际数据到达由后续的 cp.async.wait_group 保证
@@ -210,7 +218,7 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_mma_kernel(const half* __restr
         // 注：mbar_wait就不需要__syncthreads()，因为所有线程 mbar_wait 同一条 barrier(w12f文件)
         
         // 不能是 wait_group 0：等所有 group 完成；  那下一个 tile 的搬也被等，没有重叠——搬和算串行
-        // 双缓冲的核心就是 wait_group 1——留一个 group 在飞，实现重叠
+        // 双缓冲的核心就是 wait_group 1 ———— 留一个 group 在飞，实现重叠
 
         // warp 级 causal 上界
         // 每个 warp 自己的 causal 上界：只算到自己那 16 行的最后一行（纯省算，不改数值）

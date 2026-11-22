@@ -1,12 +1,19 @@
 /*
     w12e_fa2_wgmma.cu —— FA2 前向（causal + GQA），QK 用 wgmma，PV 仍用 mma.sync
 
-    K 用 wgmma，PV 仍用 mma.sync
+    QK 用 wgmma，PV 仍用 mma.sync
 
     注：
         1、wmma 是 Ampere 之前的 CUDA C++ API（nvcuda::wmma::fragment），w12b 用的是这个
         2、mma.sync 是 PTX 指令（warp 级、同步），w12c/w12d/w12e 的 PV 用的是这个
         3、wgmma 是 Hopper 的 warpgroup 级、异步指令，w12e 的 QK 用的是这个
+
+
+    在 Hopper 架构的 WGMMA 指令集中，针对 FP16（及 BF16）数据类型，其 K 维度只有 1 种固定值，即 K = 16
+    WGMMA 的 FP16 形状被严格约束为 m64nNk16 的形式，具体的维度规则如下：
+                M 维度：固定为 64
+                K 维度：固定为 16
+                N 维度：可变，必须是 8 的倍数，取值范围从 8 到 256（如 m64n8k16, m64n64k16, 直到 m64n256k16）
 
 
     与 w12d_fa2_tile128.cu 的三处结构差别：
@@ -26,7 +33,7 @@
 #include <cuda_runtime.h>
 
 
-#define TILE_M 128              // 一个 block 处理多少行 Q
+#define TILE_M 128              // 一个block负责的Q，一个block 里有 8个warp
 #define TILE_N 32               // 一次处理多少个 key
 #define HEAD_DIM 64
 #define SM_THREADS 256          // = 2 个 warpgroup
@@ -46,7 +53,7 @@ __device__ __forceinline__ unsigned pack2(float a, float b)
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
-// 4 条 lane 一起做行内归约（这 4 条 lane 共享同一行）
+// 4 条 lane 一起做行内归约
 __device__ __forceinline__ float warp_max4(float v)
 {
     v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
@@ -255,7 +262,8 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_wgmma_kernel(const half* __res
             wgmma_fence();                            // smem 已就绪
             for (int kk = 0; kk < HEAD_DIM / 16; ++kk)
             {
-                // kk 段 → 跳过 kk*16 列 = kk*2 个 k 块 = kk*128 个 half
+                // 在 Hopper 架构的 WGMMA 指令集中，针对 FP16（及 BF16）数据类型，其 K 维度只有 1 种固定值，即 K = 16
+                // 一个k16，配一个m8，就要跳跃16*8=128个元素
                 const unsigned long long ad = make_desc(qwg + kk * 128, a_lbo, a_sbo, 0);
                 const unsigned long long bd = make_desc(kt + kk * 128, b_lbo, b_sbo, 0);
                 wgmma_m64n32k16(sc, ad, bd);            // 这里是用的 wgmma
