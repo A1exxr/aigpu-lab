@@ -26,15 +26,14 @@
 #include <cstdio>
 
 
-#define TILE_M 128              // 一个 block 处理多少行 Q
+#define TILE_M 128              // 一个 block 负责的Q，这个 block 里有 12 个 warp = 3 个 warpgroup = 384 线程
 #define TILE_N 32               // 一次处理多少个 key
 #define HEAD_DIM 64
 #define SM_THREADS 384          // 3 个 warpgroup：1 producer + 2 consumer
 #define WARP_M 16               // PV 阶段：一个 warp 16 行
 #define WWG 64                  // QK 阶段：一个 warpgroup 64 行
 #define KV_CHUNK 8              // 16 B = 8 half
-#define PROD_WARPS 4            // 1 warpgroup = 4 warp
-#define CONS_WARPS (SM_THREADS / 32 - PROD_WARPS)
+#define CONS_WARPS (SM_THREADS / 32 - 4)
 #define NEG_INF (-1e30f)
 
 // ===== mbarrier.arrive（只到、不等）与 setmaxnreg =====
@@ -48,12 +47,17 @@ __device__ __forceinline__ void mbar_arrive(uint64_t *bar)
 // setmaxnreg：warpgroup 级别的寄存器再分配（sm_90a 才有）
 // Producer 不需要存累加器，主动释放寄存器给 Consumer，使 Consumer 能容纳更大的 Tile 或更多中间变量，避免 Spill
 // 必须整个 warpgroup 一起执行；立即数必须是 8 的倍数
+
+// Hoper 每个 SM 寄存器固定 65536 个，每个线程寄存器上限为 255
+// 如果统一分配： 65536/384 = 170，但consumer要232个，producer只需要40个，所以要动态分配
 __device__ __forceinline__ void wg_reg_dec_producer()
 {
+    // setmaxnreg.dec 40  主动降到40，这个数必须是8的倍数，40和232都满足
     asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n");
 }
 __device__ __forceinline__ void wg_reg_inc_consumer()
 {
+    // setmaxnreg.inc 232 升到232
     asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n");
 }
 
@@ -137,6 +141,28 @@ __device__ __forceinline__ void wgmma_m64n32k16(float (&sc)[TILE_N / 8][4],
 }
 
 
+// RS 形式：A 来自寄存器（每线程 4 个 32 位寄存器 = 8 个 half），B 来自 smem 描述符
+// d 的 32 个 float 与 acc[8][4] 是同一套行列映射：d[4*nd+c] == acc[nd][c]
+__device__ __forceinline__ void wgmma_m64n64k16_rs(float (&d)[HEAD_DIM / 8][4],
+                                                   const unsigned (&a)[4],
+                                                   unsigned long long b_desc)
+{
+    asm volatile(
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
+        "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, "
+        "{%32,%33,%34,%35}, %36, 1, 1, 1, 0;\n"
+        : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]),
+          "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
+          "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]),
+          "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]),
+          "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]),
+          "+f"(d[5][0]), "+f"(d[5][1]), "+f"(d[5][2]), "+f"(d[5][3]),
+          "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]),
+          "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "l"(b_desc));
+}
+
 // mbarrier
 __device__ __forceinline__ void mbar_init(uint64_t *bar, uint32_t count)
 {
@@ -192,34 +218,40 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_ws_kernel(const __grid_constan
     __shared__ alignas(128) half Qs[TILE_M * HEAD_DIM];        // 16 KB core-matrix
     __shared__ alignas(128) half Kbuf[2][TILE_N * HEAD_DIM];   // 2 × 4 KB 128B swizzle
     __shared__ alignas(128) half Vbuf[2][TILE_N * HEAD_DIM];   // 2 × 4 KB swizzle
-    __shared__ alignas(8) uint64_t full[2];                    // TMA 到齐（tx 计数）
-    __shared__ alignas(8) uint64_t empty[2];                   // 消费者用完了（8 个 warp 各到一次）
+
+    // 两组 mbarrier
+    __shared__ alignas(8) uint64_t full[2];                    // TMA 搬完时硬件 complete_tx 翻 phase ———— consumer 等它
+    // 8 个 consumer warp 各 arrive 一次（lane==0），凑满 8 次翻 phase ———— producer 等它
+    __shared__ alignas(8) uint64_t empty[2];                  
 
     const int bx = blockIdx.x;
     const int bh = blockIdx.y;
     const int b = bh / H;
     const int h = bh % H;
     const int kvh = h / (H / Hkv);
+    const int kv_bh = b * Hkv + kvh;        // 描述符第三维的下标
 
     const int row_base = max(0, min(bx * TILE_M, S - TILE_M));
     const size_t q_base = ((size_t)b * H + h) * S * HEAD_DIM;
 
     const int tid = threadIdx.x;
     const int lane = tid % 32;
-    const int warp_id = tid / 32;      // 0..11
-    const int wg = warp_id / 4;        // 0 = producer, 1/2 = consumer
-    const int wi = warp_id % 4;
-    const bool is_prod = (wg == 0);
-    const int cw = wg - 1;             // consumer 序号 0/1（producer 下为 -1，不使用）
+    const int warp_id = tid / 32;                   // 0..11
+    const int wg_id = warp_id / 4;                  // 0 = producer, 1/2 = consumer
+    const int warpg_id = warp_id % 4;               // warpgroup 内部的 warp 编号 0 1 2 3    
+    const bool is_prod = (wg_id == 0);              // 判断是否为 producer
+    const int consumer_id = wg_id - 1;              // consumer 序号 0/1（producer 下为 -1，不使用）
 
-    const int row0 = cw * WWG + wi * WARP_M + (lane / 4);
+    const int row0 = consumer_id * WWG + warpg_id * WARP_M + (lane / 4);
     const int row1 = row0 + 8;
 
 
     if (tid == 0)
     {
-        mbar_init(&full[0], 1);  mbar_init(&full[1], 1);
-        mbar_init(&empty[0], CONS_WARPS); mbar_init(&empty[1], CONS_WARPS);
+        mbar_init(&full[0], 1);                 // full 的 count=1：TMA 完成时硬件算 1 次 arrival
+        mbar_init(&full[1], 1);
+        mbar_init(&empty[0], CONS_WARPS);       // empty 的 count=8：8 个 consumer warp 各 lane==0 到达一次
+        mbar_init(&empty[1], CONS_WARPS);
     }
     __syncthreads();
 
@@ -235,10 +267,10 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_ws_kernel(const __grid_constan
 
     const int jt_end = min(row_base + TILE_M - 1, S - 1) / TILE_N;
 
+    // ================= producer：只搬数据，不碰 mma =================
     if (is_prod)
     {
-        // ================= producer：只搬数据，不碰 mma =================
-        wg_reg_dec_producer();
+        wg_reg_dec_producer();          // 主动释放寄存器
 
         for (int jt = 0; jt <= jt_end; ++jt)
         {
@@ -249,27 +281,32 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_ws_kernel(const __grid_constan
                 mbar_wait(&empty[buf], empty_phase);
             }
 
+            // 由于 TMA 是单线程提交、硬件DMA搬整块，所以一个线程发指令就行
+            // 整块 K/V tile 由 DMA 引擎搬
+            // 其余127各producer线程什么都不做，但setmaxnreg已经把它们寄存器降到了40，不怎么占资源
             if (tid == 0)
             {
+                // K 和 V 各 4KB
                 mbar_arrive_expect_tx(&full[buf], 2 * TILE_N * HEAD_DIM * (uint32_t)sizeof(half));
-                tma_load_3d(Kbuf[buf], &full[buf], &kmap, 0, jt * TILE_N, bh);
-                tma_load_3d(Vbuf[buf], &full[buf], &vmap, 0, jt * TILE_N, bh);
+                // 一条指令搬整个 K/V tile
+                tma_load_3d(Kbuf[buf], &full[buf], &kmap, 0, jt * TILE_N, kv_bh);
+                tma_load_3d(Vbuf[buf], &full[buf], &vmap, 0, jt * TILE_N, kv_bh);
             }
         }
         return;   // producer 到此为止
     }
 
     // ================= consumer：只算，不搬 =================
-    wg_reg_inc_consumer();
+    wg_reg_inc_consumer();      // 增加寄存器
 
-    const float qk_scale = scale;   // compute 段里用到的（w12f 里在 kernel 顶部声明）
+    const float qk_scale = scale;
     float m0 = NEG_INF, m1 = NEG_INF;
     float l0 = 0.f, l1 = 0.f;
     float acc[HEAD_DIM / 8][4];
     for (int nd = 0; nd < HEAD_DIM / 8; ++nd)
         for (int c = 0; c < 4; ++c) acc[nd][c] = 0.f;
 
-    const int jt_end_wg = min(row_base + cw * WWG + WWG - 1, S - 1) / TILE_N;
+    const int jt_end_wg = min(row_base + consumer_id * WWG + WWG - 1, S - 1) / TILE_N;
 
     for (int jt = 0; jt <= jt_end; ++jt)
     {
@@ -285,7 +322,7 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_ws_kernel(const __grid_constan
             const unsigned a_lbo = 128, a_sbo = 1024;     // A(Q)：core-matrix，swizzle=0
             const unsigned b_lbo = 1,   b_sbo = 1024;     // B(K)：128B swizzle，LBO 不用、SBO = 8 行 × 128 B
 
-            half* qwg = Qs + cw * (WWG * HEAD_DIM);   // 本 warpgroup 的 64 行
+            half* qwg = Qs + consumer_id * (WWG * HEAD_DIM);   // 本 warpgroup 的 64 行
             half* kt = Kbuf[buf];
 
             wgmma_fence();                            // smem 已就绪
@@ -295,7 +332,7 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_ws_kernel(const __grid_constan
                 // K 的 128B swizzle 布局里，第 kk 个 16-k 段是「行内第 kk 个 32 B」，不是 128 B 的整数倍
                 // 这里 K 的描述符 swizzle = 1，描述符里的 swizzle 位必须和 smem 里的物理布局一致
                 const unsigned long long bd = make_desc(kt + kk * 16, b_lbo, b_sbo, 1);
-                wgmma_m64n32k16(sc, ad, bd);            // 这里是用的 wgmma
+                wgmma_m64n32k16(sc, ad, bd);
             }
             wgmma_commit();
             wgmma_wait0();
@@ -356,27 +393,21 @@ __global__ void __launch_bounds__(SM_THREADS) fa2_ws_kernel(const __grid_constan
             }
 
 
-            // ---- O += P·V（仍是 mma.sync，V 走 ldmatrix.trans）----
+            // ---- O += P·V：wgmma RS（A 来自寄存器 pA，B 走 V 的 swizzle 描述符）----
             for (int ks = 0; ks < 2; ++ks)
-                for (int nd = 0; nd < HEAD_DIM / 8; ++nd)
-                {
-                    const int vr = ks * 16 + (lane % 8) + ((lane / 8) & 1) * 8;
-                    const half* p = Vbuf[buf] + swz(vr, nd * 8);
-                    unsigned b0, b1;
-                    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
-                                 : "=r"(b0), "=r"(b1)
-                                 : "r"((unsigned)__cvta_generic_to_shared(p)));
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                        : "+f"(acc[nd][0]), "+f"(acc[nd][1]), "+f"(acc[nd][2]), "+f"(acc[nd][3])
-                        : "r"(pA[ks][0]), "r"(pA[ks][1]), "r"(pA[ks][2]), "r"(pA[ks][3]),
-                          "r"(b0), "r"(b1));
-                }
+            {
+                const unsigned long long vd =
+                    make_desc(Vbuf[buf] + (size_t)ks * 16 * HEAD_DIM, 1, 1024, 1);
+                wgmma_m64n64k16_rs(acc, pA[ks], vd);
+            }
         }
 
+        // PV 的 wgmma 是异步的：V 还没读完，这里不能提前把 buffer 还给 producer
+        wgmma_commit();
+        wgmma_wait0();
+
         if (lane == 0)
-            mbar_arrive(&empty[buf]);
+            mbar_arrive(&empty[buf]);           // 告诉 producer：这块 buffer 用完了
     }
 
     // ---- 收尾：除 l 写回 ----
