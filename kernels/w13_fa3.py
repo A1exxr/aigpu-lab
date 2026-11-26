@@ -1,4 +1,4 @@
-"""fa3.cu 的 driver：三档 shape 对 SDPA，打印 max|diff| 与 TFLOPS。
+"""w13_fa3.cu 的 driver：三档 shape 对 SDPA，打印 max|diff| 与 TFLOPS。
 
 用法（WSL）：
     export PATH=$HOME/miniconda3/envs/triton/bin:/usr/local/cuda/bin:$PATH
@@ -21,7 +21,7 @@ if CC_MAJOR != 9:
     sys.exit(0)
 
 ARCH = f"-arch=sm_{CC_MAJOR}{CC_MINOR}a"
-SRC = (HERE / "fa3.cu").read_text(encoding="utf-8")
+SRC = (HERE / "w13_fa3.cu").read_text(encoding="utf-8")
 
 mod = load_inline(
     name="fa3_ext",
